@@ -1,0 +1,129 @@
+package firecracker
+
+import (
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+
+	"github.com/kernel/hypeman/lib/paths"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestResolveBinaryPathPrefersCustomPath(t *testing.T) {
+	SetCustomBinaryPath("")
+	t.Cleanup(func() { SetCustomBinaryPath("") })
+
+	tmpDir := t.TempDir()
+	customPath := filepath.Join(tmpDir, "firecracker")
+	require.NoError(t, os.WriteFile(customPath, []byte("#!/bin/sh\nexit 0\n"), 0755))
+
+	SetCustomBinaryPath(customPath)
+	path, err := resolveBinaryPath(nil, "")
+	require.NoError(t, err)
+	assert.Equal(t, customPath, path)
+}
+
+func TestResolveBinaryPathInvalidCustomPath(t *testing.T) {
+	SetCustomBinaryPath("")
+	t.Cleanup(func() { SetCustomBinaryPath("") })
+
+	SetCustomBinaryPath("/does/not/exist/firecracker")
+	_, err := resolveBinaryPath(nil, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid firecracker custom binary path")
+}
+
+func TestParseVersion(t *testing.T) {
+	version, err := parseVersion("")
+	require.NoError(t, err)
+	assert.Equal(t, defaultVersion, version)
+
+	_, err = parseVersion("unknown")
+	require.ErrorContains(t, err, "unsupported firecracker version")
+
+	version, err = parseVersion("v1.14.2")
+	require.NoError(t, err)
+	assert.Equal(t, V1_14_2, version)
+
+	version, err = parseVersion("v1.16.1")
+	require.NoError(t, err)
+	assert.Equal(t, V1_16_1, version)
+
+	version, err = parseVersion("v1.17.0")
+	require.NoError(t, err)
+	assert.Equal(t, V1_17_0, version)
+}
+
+func TestResolveEmbeddedBinaryVersions(t *testing.T) {
+	SetCustomBinaryPath("")
+	t.Cleanup(func() { SetCustomBinaryPath("") })
+
+	arch, err := normalizeArch()
+	require.NoError(t, err)
+
+	for _, version := range supportedVersions {
+		t.Run(string(version), func(t *testing.T) {
+			embeddedPath := filepath.ToSlash(filepath.Join("binaries", "firecracker", string(version), arch, "firecracker"))
+			if _, err := binaryFS.ReadFile(embeddedPath); err != nil {
+				t.Skipf("embedded binary %s not present in this checkout", embeddedPath)
+			}
+
+			path, err := resolveBinaryPath(paths.New(t.TempDir()), string(version))
+			require.NoError(t, err)
+			detected, err := detectVersion(path)
+			require.NoError(t, err)
+			assert.Equal(t, string(version), detected)
+		})
+	}
+}
+
+func TestResolveBinaryPathConcurrentExtraction(t *testing.T) {
+	SetCustomBinaryPath("")
+	t.Cleanup(func() { SetCustomBinaryPath("") })
+
+	arch, err := normalizeArch()
+	require.NoError(t, err)
+	embeddedPath := filepath.ToSlash(filepath.Join("binaries", "firecracker", string(defaultVersion), arch, "firecracker"))
+	if _, err := binaryFS.ReadFile(embeddedPath); err != nil {
+		t.Skipf("embedded binary %s not present in this checkout", embeddedPath)
+	}
+
+	p := paths.New(t.TempDir())
+
+	const workers = 16
+	results := make(chan string, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path, err := resolveBinaryPath(p, "")
+			results <- path
+			errs <- err
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	var firstPath string
+	for path := range results {
+		if firstPath == "" {
+			firstPath = path
+			continue
+		}
+		assert.Equal(t, firstPath, path)
+	}
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	require.NotEmpty(t, firstPath)
+	require.NoError(t, validateExecutable(firstPath))
+}

@@ -1,0 +1,54 @@
+// Package vmconfig defines the configuration schema passed from host to guest VM.
+package vmconfig
+
+// Config is the configuration passed to the guest init binary via config.json.
+// This struct is serialized by the host (lib/instances/configdisk.go) and
+// deserialized by the guest init binary (lib/system/init).
+type Config struct {
+	// Container execution parameters
+	Entrypoint []string `json:"entrypoint"`
+	Cmd        []string `json:"cmd"`
+	Workdir    string   `json:"workdir"`
+
+	// Environment variables
+	Env map[string]string `json:"env"`
+
+	// Network configuration
+	NetworkEnabled bool   `json:"network_enabled"`
+	GuestIP        string `json:"guest_ip,omitempty"`
+	GuestCIDR      int    `json:"guest_cidr,omitempty"`
+	GuestGW        string `json:"guest_gw,omitempty"`
+	GuestDNS       string `json:"guest_dns,omitempty"`
+
+	// Volume mounts
+	VolumeMounts []VolumeMount `json:"volume_mounts,omitempty"`
+
+	// Init mode: "exec" (default) or "systemd"
+	InitMode string `json:"init_mode"`
+
+	// Boot optimizations
+	SkipKernelHeaders bool `json:"skip_kernel_headers,omitempty"`
+	SkipGuestAgent    bool `json:"skip_guest_agent,omitempty"`
+
+	// EnableRosetta registers a binfmt_misc handler for x86-64 ELF binaries
+	// backed by the Rosetta interpreter mounted from the "rosetta" virtio-fs share.
+	EnableRosetta bool `json:"enable_rosetta,omitempty"`
+
+	// Optional egress MITM proxy configuration.
+	EgressProxy *EgressProxyConfig `json:"egress_proxy,omitempty"`
+}
+
+// VolumeMount represents a volume mount configuration.
+type VolumeMount struct {
+	Device        string `json:"device"`
+	Path          string `json:"path"`
+	Mode          string `json:"mode"` // "ro", "rw", or "overlay"
+	OverlayDevice string `json:"overlay_device,omitempty"`
+}
+
+// EgressProxyConfig configures guest-side trust and proxy endpoint wiring.
+type EgressProxyConfig struct {
+	Enabled   bool   `json:"enabled"`
+	ProxyURL  string `json:"proxy_url"`
+	CACertPEM string `json:"ca_cert_pem,omitempty"`
+}

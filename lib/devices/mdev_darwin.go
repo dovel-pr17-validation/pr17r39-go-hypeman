@@ -1,0 +1,76 @@
+//go:build darwin
+
+package devices
+
+import (
+	"context"
+	"fmt"
+)
+
+// SetGPUProfileCacheTTL is a no-op on macOS.
+func SetGPUProfileCacheTTL(ttl string) {
+	// No-op on macOS
+}
+
+// DiscoverVGPU reports no vGPU framework on macOS.
+func DiscoverVGPU() (VGPUFramework, []VirtualFunction, error) {
+	return VGPUFrameworkNone, nil, nil
+}
+
+// ListGPUProfiles returns an empty list on macOS.
+func ListGPUProfiles() ([]GPUProfile, error) {
+	return []GPUProfile{}, nil
+}
+
+// ListGPUProfilesWithVFs returns an empty list on macOS.
+func ListGPUProfilesWithVFs(framework VGPUFramework, vfs []VirtualFunction, quarantined map[string]struct{}) ([]GPUProfile, error) {
+	return []GPUProfile{}, nil
+}
+
+// ListMdevDevices returns an empty list on macOS.
+func ListMdevDevices() ([]MdevDevice, error) {
+	return []MdevDevice{}, nil
+}
+
+func CreateVGPU(ctx context.Context, profileName, instanceID string) (*VGPUDevice, error) {
+	return nil, ErrVGPUNotSupportedOnMacOS
+}
+
+func ListVendorVFIOProfileTypes(vfs []VirtualFunction) (map[string][]VGPUProfileType, error) {
+	return nil, ErrVGPUNotSupportedOnMacOS
+}
+
+func ConfigureVGPU(ctx context.Context, vfAddress, profileType string) error {
+	return ErrVGPUNotSupportedOnMacOS
+}
+
+// CreateMdev returns an error on macOS as mdev is not supported.
+func CreateMdev(ctx context.Context, profileName, instanceID string) (*MdevDevice, error) {
+	return nil, ErrVGPUNotSupportedOnMacOS
+}
+
+// DestroyMdev is a no-op on macOS.
+func DestroyMdev(ctx context.Context, mdevUUID string) error {
+	return nil
+}
+
+// IsMdevInUse returns false on macOS.
+func IsMdevInUse(mdevUUID string) bool {
+	return false
+}
+
+func DestroyVGPU(ctx context.Context, assignment VGPUAssignment) error {
+	if assignment.Framework != VGPUFrameworkNone && assignment.Framework != VGPUFrameworkMdev {
+		return fmt.Errorf("unknown vGPU framework %q", assignment.Framework)
+	}
+	return nil
+}
+
+func ReconcileVGPUs(ctx context.Context, protectedDevicePaths map[string]struct{}) error {
+	return nil
+}
+
+// ReconcileMdevs is a no-op on macOS.
+func ReconcileMdevs(ctx context.Context, instanceInfos []MdevReconcileInfo) error {
+	return nil
+}

@@ -1,0 +1,279 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/kernel/hypeman/lib/guest"
+	"github.com/kernel/hypeman/lib/instances"
+	"github.com/kernel/hypeman/lib/logger"
+	mw "github.com/kernel/hypeman/lib/middleware"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  32 * 1024,
+	WriteBufferSize: 32 * 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		// Allow all origins for now - can be tightened in production
+		return true
+	},
+}
+
+// ExecRequest represents the JSON body for exec requests
+type ExecRequest struct {
+	Command      []string          `json:"command"`
+	TTY          bool              `json:"tty"`
+	Env          map[string]string `json:"env,omitempty"`
+	Cwd          string            `json:"cwd,omitempty"`
+	Timeout      int32             `json:"timeout,omitempty"`        // seconds
+	WaitForAgent int32             `json:"wait_for_agent,omitempty"` // seconds to wait for guest agent to be ready
+	Rows         uint32            `json:"rows,omitempty"`           // Initial terminal rows (0 = default)
+	Cols         uint32            `json:"cols,omitempty"`           // Initial terminal cols (0 = default)
+}
+
+// ResizeMessage represents a window resize control message
+type ResizeMessage struct {
+	Resize struct {
+		Rows uint32 `json:"rows"`
+		Cols uint32 `json:"cols"`
+	} `json:"resize"`
+}
+
+func execSpanAttributes(instanceID string, tty bool) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("instance_id", instanceID),
+		attribute.Bool("tty", tty),
+	}
+}
+
+// ExecHandler handles exec requests via WebSocket for bidirectional streaming
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) ExecHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+	log := logger.FromContext(ctx)
+
+	// Get instance resolved by middleware
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		http.Error(w, `{"code":"internal_error","message":"resource not resolved"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if inst.MacOS != nil {
+		http.Error(w, `{"code":"unsupported","message":"exec is not implemented for experimental macOS instances"}`, http.StatusNotImplemented)
+		return
+	}
+
+	if inst.State != instances.StateRunning {
+		http.Error(w, fmt.Sprintf(`{"code":"invalid_state","message":"instance must be running (current state: %s)"}`, inst.State), http.StatusConflict)
+		return
+	}
+
+	// Upgrade to WebSocket first
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.ErrorContext(ctx, "websocket upgrade failed", "error", err)
+		return
+	}
+	defer ws.Close()
+
+	// Read JSON request from first WebSocket message
+	msgType, message, err := ws.ReadMessage()
+	if err != nil {
+		log.ErrorContext(ctx, "failed to read exec request", "error", err)
+		ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"error":"failed to read request: %v"}`, err)))
+		return
+	}
+
+	if msgType != websocket.TextMessage {
+		log.ErrorContext(ctx, "expected text message with JSON request", "type", msgType)
+		ws.WriteMessage(websocket.TextMessage, []byte(`{"error":"first message must be JSON text"}`))
+		return
+	}
+
+	// Parse JSON request
+	var execReq ExecRequest
+	if err := json.Unmarshal(message, &execReq); err != nil {
+		log.ErrorContext(ctx, "invalid JSON request", "error", err)
+		ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"error":"invalid JSON: %v"}`, err)))
+		return
+	}
+
+	// Default command if not specified
+	if len(execReq.Command) == 0 {
+		execReq.Command = []string{"/bin/sh"}
+	}
+
+	// Get JWT subject for audit logging (if available)
+	subject := "unknown"
+	if claims, ok := r.Context().Value("claims").(map[string]interface{}); ok {
+		if sub, ok := claims["sub"].(string); ok {
+			subject = sub
+		}
+	}
+
+	// Start OTEL span for tracing (WebSocket bypasses otelchi middleware).
+	tracer := otel.Tracer("hypeman/exec")
+	ctx, span := tracer.Start(ctx, "exec.session", trace.WithAttributes(execSpanAttributes(inst.Id, execReq.TTY)...))
+	defer span.End()
+
+	// Audit log: exec session started
+	log.InfoContext(ctx, "exec session started",
+		"instance_id", inst.Id,
+		"subject", subject,
+		"command", execReq.Command,
+		"tty", execReq.TTY,
+		"cwd", execReq.Cwd,
+		"timeout", execReq.Timeout,
+		"wait_for_agent", execReq.WaitForAgent,
+		"rows", execReq.Rows,
+		"cols", execReq.Cols,
+	)
+
+	// Create resize channel for TTY sessions
+	var resizeChan chan *guest.WindowSize
+	if execReq.TTY {
+		resizeChan = make(chan *guest.WindowSize, 10)
+		defer close(resizeChan)
+	}
+
+	// Create WebSocket read/writer wrapper that handles resize messages
+	wsConn := &wsReadWriter{ws: ws, ctx: ctx, resizeChan: resizeChan}
+
+	dialer, err := s.InstanceManager.GetVsockDialer(ctx, inst.Id)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		log.ErrorContext(ctx, "failed to get vsock dialer", "error", err)
+		ws.WriteMessage(websocket.BinaryMessage, []byte(fmt.Sprintf("Error: %v\r\n", err)))
+		ws.WriteMessage(websocket.TextMessage, []byte(`{"exitCode":127}`))
+		return
+	}
+
+	// Execute via vsock
+	exit, err := guest.ExecIntoInstance(ctx, dialer, guest.ExecOptions{
+		Command:      execReq.Command,
+		Stdin:        wsConn,
+		Stdout:       wsConn,
+		Stderr:       wsConn,
+		TTY:          execReq.TTY,
+		Env:          execReq.Env,
+		Cwd:          execReq.Cwd,
+		Timeout:      execReq.Timeout,
+		WaitForAgent: time.Duration(execReq.WaitForAgent) * time.Second,
+		Rows:         execReq.Rows,
+		Cols:         execReq.Cols,
+		ResizeChan:   resizeChan,
+	})
+
+	duration := time.Since(startTime)
+
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		log.ErrorContext(ctx, "exec failed",
+			"error", err,
+			"instance_id", inst.Id,
+			"subject", subject,
+			"duration_ms", duration.Milliseconds(),
+		)
+		// Send error message over WebSocket before closing
+		// Use BinaryMessage so the CLI writes it to stdout (it ignores TextMessage for output)
+		// Use \r\n so it displays properly when client terminal is in raw mode
+		ws.WriteMessage(websocket.BinaryMessage, []byte(fmt.Sprintf("Error: %v\r\n", err)))
+		// Send exit code 127 (command not found - standard Unix convention)
+		ws.WriteMessage(websocket.TextMessage, []byte(`{"exitCode":127}`))
+		return
+	}
+
+	// Audit log: exec session ended
+	log.InfoContext(ctx, "exec session ended",
+		"instance_id", inst.Id,
+		"subject", subject,
+		"exit_code", exit.Code,
+		"duration_ms", duration.Milliseconds(),
+	)
+	span.SetAttributes(attribute.Int("exit_code", exit.Code))
+	span.SetStatus(codes.Ok, "")
+
+	// Send close frame with exit code in JSON
+	closeMsg := fmt.Sprintf(`{"exitCode":%d}`, exit.Code)
+	ws.WriteMessage(websocket.TextMessage, []byte(closeMsg))
+}
+
+// wsReadWriter wraps a WebSocket connection to implement io.ReadWriter
+// It also handles resize control messages for TTY sessions
+type wsReadWriter struct {
+	ws         *websocket.Conn
+	ctx        context.Context
+	reader     io.Reader
+	mu         sync.Mutex
+	resizeChan chan<- *guest.WindowSize // Channel to send resize events (nil if not TTY)
+}
+
+func (w *wsReadWriter) Read(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for {
+		// If we have a pending reader, continue reading from it
+		if w.reader != nil {
+			n, err = w.reader.Read(p)
+			if err != io.EOF {
+				return n, err
+			}
+			// EOF means we finished this message, get next one
+			w.reader = nil
+		}
+
+		// Read next WebSocket message
+		messageType, data, err := w.ws.ReadMessage()
+		if err != nil {
+			return 0, err
+		}
+
+		// Handle text messages as potential control messages
+		if messageType == websocket.TextMessage && w.resizeChan != nil {
+			// Try to parse as resize message
+			var resizeMsg ResizeMessage
+			if err := json.Unmarshal(data, &resizeMsg); err == nil && resizeMsg.Resize.Rows > 0 && resizeMsg.Resize.Cols > 0 {
+				// Send resize event (non-blocking)
+				select {
+				case w.resizeChan <- &guest.WindowSize{Rows: resizeMsg.Resize.Rows, Cols: resizeMsg.Resize.Cols}:
+				default:
+					// Channel full, skip
+				}
+				continue // Get next message
+			}
+			// Not a resize message, treat as stdin
+		}
+
+		// Binary messages and non-resize text messages are stdin data
+		if messageType != websocket.BinaryMessage && messageType != websocket.TextMessage {
+			return 0, fmt.Errorf("unexpected message type: %d", messageType)
+		}
+
+		// Create reader for this message
+		w.reader = bytes.NewReader(data)
+		return w.reader.Read(p)
+	}
+}
+
+func (w *wsReadWriter) Write(p []byte) (n int, err error) {
+	if err := w.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}

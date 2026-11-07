@@ -1,0 +1,346 @@
+package images
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+
+	"github.com/u-root/u-root/pkg/cpio"
+)
+
+// ExportFormat defines supported rootfs export formats
+type ExportFormat string
+
+const (
+	FormatExt4  ExportFormat = "ext4"  // Read-only ext4 (legacy, used on Darwin)
+	FormatErofs ExportFormat = "erofs" // Read-only compressed with LZ4 (default on Linux)
+	FormatCpio  ExportFormat = "cpio"  // Uncompressed archive (initrd, fast boot)
+)
+
+// DefaultImageFormat is the default export format for OCI images.
+// On Linux, we use erofs (compressed, read-only) for smaller images.
+// On Darwin, we use ext4 because the VZ kernel doesn't have erofs support.
+var DefaultImageFormat = func() ExportFormat {
+	if runtime.GOOS == "darwin" {
+		return FormatExt4
+	}
+	return FormatErofs
+}()
+
+// ExportRootfs exports rootfs directory in specified format (public for system manager).
+func ExportRootfs(rootfsDir, outputPath string, format ExportFormat) (int64, error) {
+	return ExportRootfsWithContext(context.Background(), rootfsDir, outputPath, format)
+}
+
+// ExportRootfsWithContext exports rootfs directory and cancels external formatters with ctx.
+func ExportRootfsWithContext(ctx context.Context, rootfsDir, outputPath string, format ExportFormat) (int64, error) {
+	switch format {
+	case FormatExt4:
+		return convertToExt4(ctx, rootfsDir, outputPath)
+	case FormatErofs:
+		return convertToErofs(ctx, rootfsDir, outputPath)
+	case FormatCpio:
+		return convertToCpio(ctx, rootfsDir, outputPath)
+	default:
+		return 0, fmt.Errorf("unsupported export format: %s", format)
+	}
+}
+
+// convertToCpio packages directory as uncompressed cpio archive (initramfs format)
+// Uses uncompressed format for faster boot (kernel loads directly without decompression)
+func convertToCpio(ctx context.Context, rootfsDir, outputPath string) (int64, error) {
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return 0, fmt.Errorf("create output dir: %w", err)
+	}
+
+	// Create output file
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("create output file: %w", err)
+	}
+	keepOutput := false
+	defer func() {
+		_ = outFile.Close()
+		if !keepOutput {
+			_ = os.Remove(outputPath)
+		}
+	}()
+
+	// Create newc format cpio writer (kernel-compatible format)
+	cpioWriter := cpio.Newc.Writer(outFile)
+
+	// Create recorder for tracking inodes and device numbers
+	recorder := cpio.NewRecorder()
+
+	// Walk the rootfs directory and add all files
+	err = filepath.Walk(rootfsDir, func(path string, info os.FileInfo, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err != nil {
+			return err
+		}
+
+		// Get path relative to rootfs root
+		relPath, err := filepath.Rel(rootfsDir, path)
+		if err != nil {
+			return err
+		}
+
+		// Skip the root directory itself
+		if relPath == "." {
+			return nil
+		}
+
+		// Get cpio record from file
+		rec, err := recorder.GetRecord(path)
+		if err != nil {
+			return fmt.Errorf("get cpio record for %s: %w", path, err)
+		}
+
+		// Set the name to be relative to root
+		rec.Name = relPath
+		if rec.ReaderAt != nil {
+			rec.ReaderAt = &contextReaderAt{
+				ctx:    ctx,
+				reader: rec.ReaderAt,
+				closer: readerCloser(rec.ReaderAt),
+			}
+		}
+
+		// Write the record to the archive
+		if err := cpioWriter.WriteRecord(rec); err != nil {
+			return fmt.Errorf("write cpio record for %s: %w", path, err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return 0, fmt.Errorf("walk rootfs: %w", err)
+	}
+
+	// Write CPIO trailer (required to mark end of archive)
+	if err := cpio.WriteTrailer(cpioWriter); err != nil {
+		return 0, fmt.Errorf("write cpio trailer: %w", err)
+	}
+
+	// Get file size
+	stat, err := os.Stat(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("stat output: %w", err)
+	}
+
+	keepOutput = true
+	return stat.Size(), nil
+}
+
+type contextReaderAt struct {
+	ctx    context.Context
+	reader io.ReaderAt
+	closer io.Closer
+}
+
+func (r *contextReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.ReadAt(p, off)
+}
+
+func (r *contextReaderAt) Close() error {
+	if r.closer == nil {
+		return nil
+	}
+	return r.closer.Close()
+}
+
+func readerCloser(reader io.ReaderAt) io.Closer {
+	closer, _ := reader.(io.Closer)
+	return closer
+}
+
+// sectorSize is the block size for disk images (required by Virtualization.framework)
+const sectorSize = 4096
+
+// alignToSector rounds size up to the nearest sector boundary
+func alignToSector(size int64) int64 {
+	if size%sectorSize == 0 {
+		return size
+	}
+	return ((size / sectorSize) + 1) * sectorSize
+}
+
+// convertToExt4 converts a rootfs directory to an ext4 disk image using mkfs.ext4
+func convertToExt4(ctx context.Context, rootfsDir, diskPath string) (int64, error) {
+	// Calculate size of rootfs directory
+	sizeBytes, err := dirSizeWithContext(ctx, rootfsDir)
+	if err != nil {
+		return 0, fmt.Errorf("calculate dir size: %w", err)
+	}
+
+	// Add 50% overhead for filesystem metadata, minimum 10MB
+	// ext4 needs significant overhead for superblock, group descriptors, inode tables, etc.
+	// 20% was insufficient for small filesystems with many files (like tzdata)
+	diskSizeBytes := sizeBytes + (sizeBytes / 2)
+	const minSize = 10 * 1024 * 1024 // 10MB
+	if diskSizeBytes < minSize {
+		diskSizeBytes = minSize
+	}
+
+	// Align to sector boundary (required by macOS Virtualization.framework)
+	diskSizeBytes = alignToSector(diskSizeBytes)
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
+		return 0, fmt.Errorf("create disk parent dir: %w", err)
+	}
+
+	// Create sparse file
+	f, err := os.Create(diskPath)
+	if err != nil {
+		return 0, fmt.Errorf("create disk file: %w", err)
+	}
+	if err := f.Truncate(diskSizeBytes); err != nil {
+		f.Close()
+		return 0, fmt.Errorf("truncate disk file: %w", err)
+	}
+	f.Close()
+
+	// Format as ext4 with rootfs contents using mkfs.ext4
+	// -b 4096: 4KB blocks (standard, matches VM page size and sector alignment)
+	// -O ^has_journal: Disable journal (not needed for read-only VM mounts)
+	// -d: Copy directory contents into filesystem
+	// -F: Force creation (file not block device)
+	cmd := exec.CommandContext(ctx, mkfsExt4Binary(), "-b", "4096", "-O", "^has_journal", "-d", rootfsDir, "-F", diskPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("mkfs.ext4 failed: %w, output: %s", err, output)
+	}
+
+	// Verify final size is sector-aligned (mkfs.ext4 should preserve our truncated size)
+	stat, err := os.Stat(diskPath)
+	if err != nil {
+		return 0, fmt.Errorf("stat disk: %w", err)
+	}
+
+	// Re-align if mkfs.ext4 changed the size (shouldn't happen with -F on a regular file)
+	if stat.Size()%sectorSize != 0 {
+		alignedSize := alignToSector(stat.Size())
+		if err := os.Truncate(diskPath, alignedSize); err != nil {
+			return 0, fmt.Errorf("align disk to sector boundary: %w", err)
+		}
+		return alignedSize, nil
+	}
+
+	return stat.Size(), nil
+}
+
+// convertToErofs converts a rootfs directory to an erofs disk image using mkfs.erofs
+func convertToErofs(ctx context.Context, rootfsDir, diskPath string) (int64, error) {
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
+		return 0, fmt.Errorf("create disk parent dir: %w", err)
+	}
+
+	// Create erofs image with LZ4 fast compression
+	// -zlz4: LZ4 fast compression (~20-25% space savings, faster builds)
+	// erofs doesn't need pre-allocation, creates file directly
+	cmd := exec.CommandContext(ctx, "mkfs.erofs", "-zlz4", diskPath, rootfsDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("mkfs.erofs failed: %w, output: %s", err, output)
+	}
+
+	// Get actual disk size
+	stat, err := os.Stat(diskPath)
+	if err != nil {
+		return 0, fmt.Errorf("stat disk: %w", err)
+	}
+
+	// Align to sector boundary (required by macOS Virtualization.framework)
+	if stat.Size()%sectorSize != 0 {
+		alignedSize := alignToSector(stat.Size())
+		if err := os.Truncate(diskPath, alignedSize); err != nil {
+			return 0, fmt.Errorf("align erofs disk to sector boundary: %w", err)
+		}
+		return alignedSize, nil
+	}
+
+	return stat.Size(), nil
+}
+
+// dirSize is used by layer-store reconciliation.
+func dirSize(path string) (int64, error) {
+	return dirSizeWithContext(context.Background(), path)
+}
+
+func dirSizeWithContext(ctx context.Context, path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}
+
+// CreateEmptyExt4Disk creates a sparse disk file and formats it as ext4.
+// Used for volumes and instance overlays that need empty writable filesystems.
+func CreateEmptyExt4Disk(diskPath string, sizeBytes int64) error {
+	// Align to sector boundary (required by macOS Virtualization.framework)
+	sizeBytes = alignToSector(sizeBytes)
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
+		return fmt.Errorf("create disk parent dir: %w", err)
+	}
+
+	// Create sparse file
+	file, err := os.Create(diskPath)
+	if err != nil {
+		return fmt.Errorf("create disk file: %w", err)
+	}
+	file.Close()
+
+	// Truncate to specified size to create sparse file
+	if err := os.Truncate(diskPath, sizeBytes); err != nil {
+		return fmt.Errorf("truncate disk file: %w", err)
+	}
+
+	// Format as ext4 with 4KB blocks (matches sector alignment)
+	cmd := exec.Command(mkfsExt4Binary(), "-b", "4096", "-F", diskPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %w, output: %s", err, output)
+	}
+
+	return nil
+}
+
+func mkfsExt4Binary() string {
+	if path, err := exec.LookPath("mkfs.ext4"); err == nil {
+		return path
+	}
+	for _, path := range []string{
+		"/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+		"/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+	} {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+			return path
+		}
+	}
+	return "mkfs.ext4"
+}

@@ -1,0 +1,693 @@
+package instances
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/instances/phasetracking"
+	"github.com/kernel/hypeman/lib/paths"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestListMetadataForReconcileFailsOnInvalidMetadata(t *testing.T) {
+	m := &manager{paths: paths.New(t.TempDir())}
+
+	require.NoError(t, m.ensureDirectories("valid"))
+	require.NoError(t, m.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+		Id:        "valid",
+		Name:      "valid",
+		CreatedAt: time.Now(),
+		DataDir:   m.paths.InstanceDir("valid"),
+	}}))
+	require.NoError(t, m.ensureDirectories("invalid"))
+	require.NoError(t, os.WriteFile(m.paths.InstanceMetadata("invalid"), []byte("{"), 0644))
+
+	listed, err := m.ListInstances(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+
+	_, err = m.listMetadataForReconcile()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "load metadata for instance invalid")
+
+	require.NoError(t, os.Remove(m.paths.InstanceMetadata("invalid")))
+	metadata, err := m.listMetadataForReconcile()
+	require.NoError(t, err)
+	require.Len(t, metadata, 1)
+	assert.Equal(t, "valid", metadata[0].Id)
+}
+
+func TestListMetadataForReconcileSkipsInstanceDeletedDuringListing(t *testing.T) {
+	m := &manager{paths: paths.New(t.TempDir())}
+
+	for _, id := range []string{"aaa-ghost", "zzz-live"} {
+		require.NoError(t, m.ensureDirectories(id))
+		require.NoError(t, m.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+			Id:        id,
+			Name:      id,
+			CreatedAt: time.Now(),
+			DataDir:   m.paths.InstanceDir(id),
+		}}))
+	}
+
+	unlock := hypervisor.LockSnapshotSourceAliasMutation()
+	type result struct {
+		metadata []StoredMetadata
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		metadata, err := m.listMetadataForReconcile()
+		done <- result{metadata, err}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, os.Remove(m.paths.InstanceMetadata("aaa-ghost")))
+	unlock()
+
+	res := <-done
+	require.NoError(t, res.err)
+	require.Len(t, res.metadata, 1)
+	assert.Equal(t, "zzz-live", res.metadata[0].Id)
+}
+
+func TestParseExitSentinelLine(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		line     string
+		wantOK   bool
+		wantCode int
+		wantMsg  string
+	}{
+		{
+			name:     "standard log line with sentinel",
+			line:     `2026-02-13T15:26:27Z [INFO] [hypeman-init:entrypoint] HYPEMAN-EXIT code=127 message="command not found"`,
+			wantOK:   true,
+			wantCode: 127,
+			wantMsg:  "command not found",
+		},
+		{
+			name:     "exit code 0",
+			line:     `2026-02-13T15:26:27Z [INFO] [hypeman-init:entrypoint] HYPEMAN-EXIT code=0 message="success"`,
+			wantOK:   true,
+			wantCode: 0,
+			wantMsg:  "success",
+		},
+		{
+			name:     "SIGKILL with OOM",
+			line:     `2026-02-13T15:26:27Z [INFO] [hypeman-init:entrypoint] HYPEMAN-EXIT code=137 message="killed by signal 9 (killed) - OOM"`,
+			wantOK:   true,
+			wantCode: 137,
+			wantMsg:  "killed by signal 9 (killed) - OOM",
+		},
+		{
+			name:     "message with escaped quotes",
+			line:     `HYPEMAN-EXIT code=1 message="error: \"bad thing\""`,
+			wantOK:   true,
+			wantCode: 1,
+			wantMsg:  `error: "bad thing"`,
+		},
+		{
+			name:   "no sentinel",
+			line:   "2026-02-13T15:26:27Z [INFO] [hypeman-init:entrypoint] app exited with code 127",
+			wantOK: false,
+		},
+		{
+			name:   "empty line",
+			line:   "",
+			wantOK: false,
+		},
+		{
+			name:   "partial sentinel",
+			line:   "HYPEMAN-EXIT",
+			wantOK: false,
+		},
+		{
+			name:     "sentinel without message",
+			line:     "HYPEMAN-EXIT code=42",
+			wantOK:   true,
+			wantCode: 42,
+			wantMsg:  "",
+		},
+		{
+			name:   "invalid code",
+			line:   "HYPEMAN-EXIT code=abc message=\"error\"",
+			wantOK: false,
+		},
+		{
+			name:     "line with carriage return from serial console",
+			line:     "2026-02-13T15:26:27Z [INFO] [hypeman-init:entrypoint] HYPEMAN-EXIT code=0 message=\"success\"\r",
+			wantOK:   true,
+			wantCode: 0,
+			wantMsg:  "success",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			code, msg, ok := parseExitSentinelLine(tc.line)
+			require.Equal(t, tc.wantOK, ok, "parseExitSentinelLine(%q) ok=%v, want %v", tc.line, ok, tc.wantOK)
+			if ok {
+				assert.Equal(t, tc.wantCode, code, "exit code mismatch")
+				assert.Equal(t, tc.wantMsg, msg, "exit message mismatch")
+			}
+		})
+	}
+}
+
+func TestParseProgramStartSentinelLine(t *testing.T) {
+	t.Parallel()
+
+	ts := "2026-03-08T15:09:26.123456789Z"
+	line := "2026-03-08T15:09:26Z [INFO] [hypeman-init:entrypoint] HYPEMAN-PROGRAM-START ts=" + ts + " mode=exec"
+
+	parsed, ok := parseProgramStartSentinelLine(line)
+	require.True(t, ok)
+	assert.Equal(t, ts, parsed.UTC().Format(time.RFC3339Nano))
+}
+
+func TestParseAgentReadySentinelLine(t *testing.T) {
+	t.Parallel()
+
+	ts := "2026-03-08T15:09:26.987654321Z"
+	line := "2026/03/08 15:09:26 [guest-agent] HYPEMAN-AGENT-READY ts=" + ts
+
+	parsed, ok := parseAgentReadySentinelLine(line)
+	require.True(t, ok)
+	assert.Equal(t, ts, parsed.UTC().Format(time.RFC3339Nano))
+}
+
+func TestDeriveRunningState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+
+	tests := []struct {
+		name   string
+		stored StoredMetadata
+		want   State
+	}{
+		{
+			name: "initializing when program start marker missing",
+			stored: StoredMetadata{
+				SkipGuestAgent: false,
+			},
+			want: StateInitializing,
+		},
+		{
+			name: "initializing when guest-agent marker missing",
+			stored: StoredMetadata{
+				ProgramStartedAt: &now,
+				SkipGuestAgent:   false,
+			},
+			want: StateInitializing,
+		},
+		{
+			name: "running when both markers present",
+			stored: StoredMetadata{
+				ProgramStartedAt:  &now,
+				GuestAgentReadyAt: &now,
+				SkipGuestAgent:    false,
+			},
+			want: StateRunning,
+		},
+		{
+			name: "running when guest-agent is skipped",
+			stored: StoredMetadata{
+				ProgramStartedAt: &now,
+				SkipGuestAgent:   true,
+			},
+			want: StateRunning,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, deriveRunningState(&tt.stored))
+		})
+	}
+}
+
+func TestRunningPhaseFromMarkers(t *testing.T) {
+	t.Parallel()
+
+	program := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	agent := program.Add(2 * time.Second)
+	agentBeforeProgram := program.Add(-1 * time.Second)
+
+	tests := []struct {
+		name         string
+		stored       StoredMetadata
+		wantPhase    phasetracking.Phase
+		wantTransAt  time.Time
+		wantHasTrans bool
+	}{
+		{
+			name:      "no markers → initializing",
+			stored:    StoredMetadata{},
+			wantPhase: phasetracking.PhaseInitializing,
+		},
+		{
+			name: "skip-agent + program only → running at program time",
+			stored: StoredMetadata{
+				ProgramStartedAt: &program,
+				SkipGuestAgent:   true,
+			},
+			wantPhase:    phasetracking.PhaseRunning,
+			wantTransAt:  program,
+			wantHasTrans: true,
+		},
+		{
+			name: "program without agent → still initializing",
+			stored: StoredMetadata{
+				ProgramStartedAt: &program,
+			},
+			wantPhase: phasetracking.PhaseInitializing,
+		},
+		{
+			name: "both markers, agent later → running at agent time",
+			stored: StoredMetadata{
+				ProgramStartedAt:  &program,
+				GuestAgentReadyAt: &agent,
+			},
+			wantPhase:    phasetracking.PhaseRunning,
+			wantTransAt:  agent,
+			wantHasTrans: true,
+		},
+		{
+			name: "both markers, program later → running at program time",
+			stored: StoredMetadata{
+				ProgramStartedAt:  &program,
+				GuestAgentReadyAt: &agentBeforeProgram,
+			},
+			wantPhase:    phasetracking.PhaseRunning,
+			wantTransAt:  program,
+			wantHasTrans: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPhase, gotAt := runningPhaseFromMarkers(&tt.stored)
+			assert.Equal(t, tt.wantPhase, gotPhase)
+			if tt.wantHasTrans {
+				assert.True(t, gotAt.Equal(tt.wantTransAt), "transition time = %v, want %v", gotAt, tt.wantTransAt)
+			} else {
+				assert.True(t, gotAt.IsZero(), "expected zero transition time, got %v", gotAt)
+			}
+		})
+	}
+}
+
+func TestAdvancePhaseIfRunning(t *testing.T) {
+	t.Parallel()
+
+	bootStart := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	program := bootStart.Add(500 * time.Millisecond)
+	agent := bootStart.Add(3 * time.Second)
+
+	t.Run("initializing with no markers stays initializing", func(t *testing.T) {
+		stored := StoredMetadata{}
+		stored.Phases.Record(phasetracking.PhaseInitializing, bootStart)
+
+		advancePhaseIfRunning(&stored)
+		assert.Equal(t, phasetracking.PhaseInitializing, stored.Phases.Current)
+	})
+
+	t.Run("initializing with complete markers advances using marker time", func(t *testing.T) {
+		stored := StoredMetadata{
+			ProgramStartedAt:  &program,
+			GuestAgentReadyAt: &agent,
+		}
+		stored.Phases.Record(phasetracking.PhaseInitializing, bootStart)
+
+		advancePhaseIfRunning(&stored)
+
+		assert.Equal(t, phasetracking.PhaseRunning, stored.Phases.Current)
+		assert.True(t, stored.Phases.Since.Equal(agent), "Since should be marker time, got %v", stored.Phases.Since)
+		// Initializing duration should reflect bootStart→agent, not now.
+		wantMs := agent.Sub(bootStart).Milliseconds()
+		assert.Equal(t, wantMs, stored.Phases.Cumulative[phasetracking.PhaseInitializing])
+	})
+
+	t.Run("idempotent: already running stays running", func(t *testing.T) {
+		stored := StoredMetadata{
+			ProgramStartedAt:  &program,
+			GuestAgentReadyAt: &agent,
+		}
+		stored.Phases.Record(phasetracking.PhaseRunning, agent)
+		runningSince := stored.Phases.Since
+
+		advancePhaseIfRunning(&stored)
+
+		assert.Equal(t, phasetracking.PhaseRunning, stored.Phases.Current)
+		assert.True(t, stored.Phases.Since.Equal(runningSince), "Since should not move on idempotent call")
+	})
+
+	t.Run("non-initializing current phase is left alone", func(t *testing.T) {
+		// A Standby instance whose markers still indicate Running must not be
+		// flipped back to Running — phase transitions are driven by lifecycle
+		// orchestration, not by stale markers.
+		stored := StoredMetadata{
+			ProgramStartedAt:  &program,
+			GuestAgentReadyAt: &agent,
+		}
+		stored.Phases.Record(phasetracking.PhaseStandby, bootStart.Add(10*time.Second))
+
+		advancePhaseIfRunning(&stored)
+		assert.Equal(t, phasetracking.PhaseStandby, stored.Phases.Current)
+	})
+
+	t.Run("marker time before Since is clamped forward", func(t *testing.T) {
+		// Restore-from-early-standby: the instance was standbyed mid-boot
+		// before markers ever hydrated. Phases.Since is set at restore time.
+		// When the markers eventually parse, they may carry pre-standby
+		// timestamps (older than restore). Letting Since walk backwards would
+		// over-count Running on the next transition by the full standby
+		// interval — billing-critical.
+		restoreTime := bootStart.Add(1 * time.Hour)
+		stored := StoredMetadata{
+			ProgramStartedAt:  &program, // 500ms after bootStart — predates restore
+			GuestAgentReadyAt: &agent,   // 3s after bootStart — also predates restore
+		}
+		stored.Phases.Record(phasetracking.PhaseInitializing, restoreTime)
+
+		advancePhaseIfRunning(&stored)
+
+		assert.Equal(t, phasetracking.PhaseRunning, stored.Phases.Current)
+		assert.True(t, stored.Phases.Since.Equal(restoreTime),
+			"Since must not move backwards; got %v, want %v", stored.Phases.Since, restoreTime)
+		// No Initializing duration is credited — elapsed at the clamp is zero.
+		assert.Zero(t, stored.Phases.Cumulative[phasetracking.PhaseInitializing])
+	})
+}
+
+func TestHydrateBootMarkersFromLogs_AdvancesPhaseOnRunningTransition(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	m := &manager{
+		paths: paths.New(tmpDir),
+	}
+
+	bootStart := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return bootStart.Add(5 * time.Second) }
+
+	meta := &StoredMetadata{
+		Id:             "phase-advance-test",
+		SkipGuestAgent: false,
+		StartedAt:      &bootStart,
+	}
+	meta.Phases.Record(phasetracking.PhaseInitializing, bootStart)
+
+	logPath := m.paths.InstanceAppLog(meta.Id)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o755))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		"HYPEMAN-AGENT-READY ts=2026-05-11T12:00:02Z\n"+
+			"HYPEMAN-PROGRAM-START ts=2026-05-11T12:00:01Z mode=exec\n",
+	), 0o644))
+
+	hydrated := m.hydrateBootMarkersFromLogs(t.Context(), meta)
+	require.True(t, hydrated)
+	require.NotNil(t, meta.ProgramStartedAt)
+	require.NotNil(t, meta.GuestAgentReadyAt)
+
+	assert.Equal(t, phasetracking.PhaseRunning, meta.Phases.Current, "phase should advance to running")
+	// Initializing duration = bootStart → max(program, agent) = 2s.
+	assert.Equal(t, int64(2_000), meta.Phases.Cumulative[phasetracking.PhaseInitializing])
+}
+
+func TestHydrateBootMarkersFromLogs_RescanThrottle(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	m := &manager{
+		paths: paths.New(tmpDir),
+	}
+
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return now }
+
+	meta := &StoredMetadata{
+		Id:             "test-instance",
+		SkipGuestAgent: false,
+	}
+
+	// First call finds nothing and schedules a deferred rescan.
+	hydrated := m.hydrateBootMarkersFromLogs(t.Context(), meta)
+	require.False(t, hydrated)
+	require.Nil(t, meta.ProgramStartedAt)
+	require.Nil(t, meta.GuestAgentReadyAt)
+
+	logPath := m.paths.InstanceAppLog(meta.Id)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o755))
+	err := os.WriteFile(logPath, []byte(
+		"HYPEMAN-AGENT-READY ts=2026-03-08T12:00:00Z\n"+
+			"HYPEMAN-PROGRAM-START ts=2026-03-08T12:00:01Z mode=exec\n",
+	), 0o644)
+	require.NoError(t, err)
+
+	// Immediate second call should be throttled and skip scanning.
+	hydrated = m.hydrateBootMarkersFromLogs(t.Context(), meta)
+	require.False(t, hydrated)
+	require.Nil(t, meta.ProgramStartedAt)
+	require.Nil(t, meta.GuestAgentReadyAt)
+
+	// Once the rescan interval has elapsed, markers are hydrated.
+	now = now.Add(bootMarkerRescanInterval + time.Millisecond)
+	hydrated = m.hydrateBootMarkersFromLogs(t.Context(), meta)
+	require.True(t, hydrated)
+	require.NotNil(t, meta.ProgramStartedAt)
+	require.NotNil(t, meta.GuestAgentReadyAt)
+}
+
+func TestHydrateBootMarkersUsesGuestAgentProbeWhenReadyMarkerMissing(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	readyAt := time.Date(2026, 3, 8, 12, 0, 2, 0, time.UTC)
+	probeCalls := 0
+	m := &manager{
+		paths: paths.New(tmpDir),
+		now:   func() time.Time { return readyAt },
+		guestAgentReadyProbe: func(context.Context, *StoredMetadata) bool {
+			probeCalls++
+			return true
+		},
+	}
+
+	meta := &StoredMetadata{
+		Id:             "systemd-instance",
+		SkipGuestAgent: false,
+	}
+	logPath := m.paths.InstanceAppLog(meta.Id)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o755))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		"HYPEMAN-PROGRAM-START ts=2026-03-08T12:00:01Z mode=systemd\n",
+	), 0o644))
+
+	hydrated := m.hydrateBootMarkersFromLogs(context.Background(), meta)
+	require.True(t, hydrated)
+	require.NotNil(t, meta.ProgramStartedAt)
+	require.NotNil(t, meta.GuestAgentReadyAt)
+	assert.Equal(t, readyAt.Format(time.RFC3339Nano), meta.GuestAgentReadyAt.UTC().Format(time.RFC3339Nano))
+	assert.Equal(t, 1, probeCalls)
+}
+
+func TestParseBootMarkers_IgnoresStaleMarkersBeforeBootStart(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	m := &manager{
+		paths: paths.New(tmpDir),
+	}
+
+	id := "boot-markers-instance"
+	logPath := m.paths.InstanceAppLog(id)
+	rotatedLogPath := logPath + ".1"
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o755))
+
+	bootStart := time.Date(2026, 3, 9, 4, 0, 0, 0, time.UTC)
+	staleProgram := bootStart.Add(-2 * time.Minute)
+	staleAgent := bootStart.Add(-90 * time.Second)
+	freshProgram := bootStart.Add(2 * time.Second)
+	freshAgent := bootStart.Add(3 * time.Second)
+
+	staleData := "" +
+		"HYPEMAN-PROGRAM-START ts=" + staleProgram.Format(time.RFC3339Nano) + " mode=exec\n" +
+		"HYPEMAN-AGENT-READY ts=" + staleAgent.Format(time.RFC3339Nano) + "\n"
+	require.NoError(t, os.WriteFile(rotatedLogPath, []byte(staleData), 0o644))
+	require.NoError(t, os.Chtimes(rotatedLogPath, bootStart.Add(-time.Minute), bootStart.Add(-time.Minute)))
+
+	freshData := "" +
+		"HYPEMAN-PROGRAM-START ts=" + freshProgram.Format(time.RFC3339Nano) + " mode=exec\n" +
+		"HYPEMAN-AGENT-READY ts=" + freshAgent.Format(time.RFC3339Nano) + "\n"
+	require.NoError(t, os.WriteFile(logPath, []byte(freshData), 0o644))
+	require.NoError(t, os.Chtimes(logPath, bootStart.Add(time.Second), bootStart.Add(time.Second)))
+
+	programStartedAt, guestAgentReadyAt := m.parseBootMarkers(t.Context(), id, true, true, &bootStart)
+	require.NotNil(t, programStartedAt)
+	require.NotNil(t, guestAgentReadyAt)
+	assert.Equal(t, freshProgram.Format(time.RFC3339Nano), programStartedAt.UTC().Format(time.RFC3339Nano))
+	assert.Equal(t, freshAgent.Format(time.RFC3339Nano), guestAgentReadyAt.UTC().Format(time.RFC3339Nano))
+}
+
+func TestParseBootMarkers_ReturnsLatestMarkerFromNewestLog(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	m := &manager{
+		paths: paths.New(tmpDir),
+	}
+
+	id := "latest-marker-instance"
+	logPath := m.paths.InstanceAppLog(id)
+	rotatedLogPath := logPath + ".1"
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o755))
+
+	oldProgram := time.Date(2026, 3, 9, 4, 0, 0, 0, time.UTC)
+	oldAgent := oldProgram.Add(500 * time.Millisecond)
+	newProgram := oldProgram.Add(3 * time.Second)
+	newProgramLatest := oldProgram.Add(4 * time.Second)
+	newAgent := oldProgram.Add(3500 * time.Millisecond)
+
+	require.NoError(t, os.WriteFile(rotatedLogPath, []byte(
+		"HYPEMAN-PROGRAM-START ts="+oldProgram.Format(time.RFC3339Nano)+" mode=exec\n"+
+			"HYPEMAN-AGENT-READY ts="+oldAgent.Format(time.RFC3339Nano)+"\n",
+	), 0o644))
+
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		"HYPEMAN-PROGRAM-START ts="+newProgram.Format(time.RFC3339Nano)+" mode=exec\n"+
+			"HYPEMAN-AGENT-READY ts="+newAgent.Format(time.RFC3339Nano)+"\n"+
+			"HYPEMAN-PROGRAM-START ts="+newProgramLatest.Format(time.RFC3339Nano)+" mode=exec\n",
+	), 0o644))
+
+	programStartedAt, guestAgentReadyAt := m.parseBootMarkers(t.Context(), id, true, true, nil)
+	require.NotNil(t, programStartedAt)
+	require.NotNil(t, guestAgentReadyAt)
+	assert.Equal(t, newProgramLatest.Format(time.RFC3339Nano), programStartedAt.UTC().Format(time.RFC3339Nano))
+	assert.Equal(t, newAgent.Format(time.RFC3339Nano), guestAgentReadyAt.UTC().Format(time.RFC3339Nano))
+}
+
+func TestAppLogPathsForMarkerScan_IgnoresArchivedLogs(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	m := &manager{
+		paths: paths.New(tmpDir),
+	}
+
+	id := "log-order-instance"
+	logPath := m.paths.InstanceAppLog(id)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o755))
+
+	for _, p := range []string{
+		logPath,
+		logPath + ".1",
+		logPath + ".2",
+		logPath + ".prev.12345",
+		logPath + "-debug-copy",
+	} {
+		require.NoError(t, os.WriteFile(p, []byte("x\n"), 0o644))
+	}
+
+	paths := m.appLogPathsForMarkerScan(id)
+	require.Equal(t, []string{logPath + ".2", logPath + ".1", logPath}, paths)
+}
+
+func TestHypervisorStateCache_TTL(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	m := &manager{}
+	m.now = func() time.Time { return now }
+
+	_, ok := m.loadCachedHypervisorState("missing")
+	require.False(t, ok)
+
+	m.storeCachedHypervisorState("vm-1", hypervisor.StateRunning)
+	got, ok := m.loadCachedHypervisorState("vm-1")
+	require.True(t, ok)
+	require.Equal(t, hypervisor.StateRunning, got)
+
+	// Advance just under TTL — still a hit.
+	now = now.Add(hypervisorStateCacheTTL - time.Millisecond)
+	got, ok = m.loadCachedHypervisorState("vm-1")
+	require.True(t, ok)
+	require.Equal(t, hypervisor.StateRunning, got)
+
+	// Past TTL — treated as miss so derive_state will re-query.
+	now = now.Add(2 * time.Millisecond)
+	_, ok = m.loadCachedHypervisorState("vm-1")
+	require.False(t, ok)
+}
+
+func TestHypervisorStateCache_InvalidationAndUpdate(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	m := &manager{}
+	m.now = func() time.Time { return now }
+
+	m.storeCachedHypervisorState("vm-1", hypervisor.StateRunning)
+	m.invalidateCachedHypervisorState("vm-1")
+	_, ok := m.loadCachedHypervisorState("vm-1")
+	require.False(t, ok)
+
+	// Lifecycle event with a live-socket state populates the cache.
+	m.updateCachedHypervisorStateFromInstance(&Instance{
+		StoredMetadata: StoredMetadata{Id: "vm-1"},
+		State:          StateInitializing,
+	})
+	got, ok := m.loadCachedHypervisorState("vm-1")
+	require.True(t, ok)
+	require.Equal(t, hypervisor.StateRunning, got)
+
+	m.updateCachedHypervisorStateFromInstance(&Instance{
+		StoredMetadata: StoredMetadata{Id: "vm-1"},
+		State:          StatePaused,
+	})
+	got, ok = m.loadCachedHypervisorState("vm-1")
+	require.True(t, ok)
+	require.Equal(t, hypervisor.StatePaused, got)
+
+	// Standby has no live socket, so the cache must be cleared so the next
+	// derive_state correctly short-circuits to Standby/Stopped via the
+	// socket check rather than reusing a stale Running entry.
+	m.updateCachedHypervisorStateFromInstance(&Instance{
+		StoredMetadata: StoredMetadata{Id: "vm-1"},
+		State:          StateStandby,
+	})
+	_, ok = m.loadCachedHypervisorState("vm-1")
+	require.False(t, ok)
+}
+
+func TestNotifyLifecycleEvent_UpdatesAndDropsHypervisorStateCache(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	m := &manager{
+		lifecycleEvents: newLifecycleSubscribers(),
+	}
+	m.now = func() time.Time { return now }
+
+	inst := &Instance{
+		StoredMetadata: StoredMetadata{Id: "vm-2"},
+		State:          StateRunning,
+	}
+	m.notifyLifecycleEvent(t.Context(), LifecycleEventStart, inst)
+	got, ok := m.loadCachedHypervisorState("vm-2")
+	require.True(t, ok)
+	require.Equal(t, hypervisor.StateRunning, got)
+
+	// Delete must drop the cache so a future re-create with the same id does
+	// not race with a stale entry from before deletion.
+	m.notifyLifecycleDelete(t.Context(), "vm-2")
+	_, ok = m.loadCachedHypervisorState("vm-2")
+	require.False(t, ok)
+}

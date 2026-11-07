@@ -1,0 +1,843 @@
+//go:build linux
+
+package devices
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kernel/hypeman/lib/logger"
+)
+
+const (
+	mdevBusPath               = "/sys/class/mdev_bus"
+	mdevDevices               = "/sys/bus/mdev/devices"
+	procPath                  = "/proc"
+	mdevAssignmentGracePeriod = 5 * time.Minute
+)
+
+// mdevMu protects mdev creation/destruction to prevent race conditions
+// when multiple instances request vGPUs concurrently.
+var mdevMu sync.Mutex
+
+// profileMetadata holds static profile info (doesn't change after driver load)
+type profileMetadata struct {
+	TypeName      string // e.g., "nvidia-1145"
+	Name          string // e.g., "NVIDIA L40S-1B"
+	FramebufferMB int
+}
+
+// cachedProfiles holds profile metadata with TTL-based expiry.
+var (
+	cachedProfiles     []profileMetadata
+	cachedProfilesMu   sync.RWMutex
+	cachedProfilesTime time.Time
+	gpuProfileCacheTTL time.Duration = 30 * time.Minute // default
+)
+
+// SetGPUProfileCacheTTL sets the TTL for GPU profile metadata cache.
+// Should be called during application startup with the config value.
+func SetGPUProfileCacheTTL(ttl string) {
+	if ttl == "" {
+		return
+	}
+	if d, err := time.ParseDuration(ttl); err == nil {
+		gpuProfileCacheTTL = d
+	}
+}
+
+// getProfileCacheTTL returns the configured TTL for profile metadata cache.
+func getProfileCacheTTL() time.Duration {
+	return gpuProfileCacheTTL
+}
+
+// getCachedProfiles returns cached profile metadata, refreshing if TTL has expired.
+func getCachedProfiles(firstVF string) []profileMetadata {
+	ttl := getProfileCacheTTL()
+
+	// Fast path: check with read lock
+	cachedProfilesMu.RLock()
+	if len(cachedProfiles) > 0 && time.Since(cachedProfilesTime) < ttl {
+		profiles := cachedProfiles
+		cachedProfilesMu.RUnlock()
+		return profiles
+	}
+	cachedProfilesMu.RUnlock()
+
+	// Slow path: refresh cache with write lock
+	cachedProfilesMu.Lock()
+	defer cachedProfilesMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if len(cachedProfiles) > 0 && time.Since(cachedProfilesTime) < ttl {
+		return cachedProfiles
+	}
+
+	cachedProfiles = loadProfileMetadata(firstVF)
+	cachedProfilesTime = time.Now()
+	return cachedProfiles
+}
+
+// discoverMdevVFs returns all SR-IOV Virtual Functions available for vGPU,
+// discovered by scanning /sys/class/mdev_bus/.
+func discoverMdevVFs() ([]VirtualFunction, error) {
+	return discoverMdevVFsWith(mdevBusPath, pciDevicesPath, ListMdevDevices)
+}
+
+func discoverMdevVFsWith(busPath, pciPath string, listMdevs func() ([]MdevDevice, error)) ([]VirtualFunction, error) {
+	entries, err := os.ReadDir(busPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No mdev_bus means no mdev vGPU support
+		}
+		return nil, fmt.Errorf("read mdev_bus: %w", err)
+	}
+
+	// List mdevs once and build a lookup map to avoid O(n*m) performance
+	mdevs, _ := listMdevs()
+	mdevByVF := make(map[string]bool, len(mdevs))
+	for _, mdev := range mdevs {
+		mdevByVF[mdev.VFAddress] = true
+	}
+
+	var vfs []VirtualFunction
+	var vfErrs []error
+	for _, entry := range entries {
+		vfAddr := entry.Name()
+		types, err := os.ReadDir(filepath.Join(busPath, vfAddr, "mdev_supported_types"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			vfErrs = append(vfErrs, fmt.Errorf("read mdev supported types for VF %s: %w", vfAddr, err))
+			continue
+		}
+		usable := false
+		for _, typ := range types {
+			if typ.IsDir() {
+				usable = true
+				break
+			}
+		}
+		if !usable {
+			continue
+		}
+
+		// Find parent GPU by checking physfn symlink
+		// VFs have a physfn symlink pointing to their parent Physical Function
+		physfnPath := filepath.Join(pciPath, vfAddr, "physfn")
+		parentGPU := ""
+		if target, err := os.Readlink(physfnPath); err == nil {
+			parentGPU = filepath.Base(target)
+		}
+
+		// Check if this VF already has an mdev (using pre-built lookup map)
+		hasMdev := mdevByVF[vfAddr]
+
+		vfs = append(vfs, VirtualFunction{
+			PCIAddress: vfAddr,
+			ParentGPU:  parentGPU,
+			Allocated:  hasMdev,
+		})
+	}
+	if len(vfErrs) > 0 {
+		// Mirror vendor VFIO discovery: one unreadable VF must not blank out
+		// the host's GPU capacity. Only when no VF is readable does discovery
+		// fail, so a wholesale sysfs outage cannot demote an mdev host to
+		// vendor VFIO or passthrough while assignments exist.
+		if len(vfs) == 0 {
+			return nil, errors.Join(vfErrs...)
+		}
+		slog.Default().Warn("skipping unreadable mdev VFs", "error", errors.Join(vfErrs...))
+	}
+
+	return vfs, nil
+}
+
+// listMdevGPUProfilesWithVFs returns available vGPU profiles using
+// pre-discovered VFs. Uses parallel sysfs reads for fast availability counting.
+func listMdevGPUProfilesWithVFs(vfs []VirtualFunction) ([]GPUProfile, error) {
+	if len(vfs) == 0 {
+		return nil, nil
+	}
+
+	// Load profile metadata with TTL-based caching
+	cachedMeta := getCachedProfiles(vfs[0].PCIAddress)
+
+	// Count availability for all profiles in parallel
+	availability := countAvailableVFsForProfilesParallel(vfs, cachedMeta)
+
+	// Build result with dynamic availability counts
+	profiles := make([]GPUProfile, 0, len(cachedMeta))
+	for _, meta := range cachedMeta {
+		profiles = append(profiles, GPUProfile{
+			Name:          meta.Name,
+			FramebufferMB: meta.FramebufferMB,
+			Available:     availability[meta.TypeName],
+		})
+	}
+
+	return profiles, nil
+}
+
+// loadProfileMetadata reads static profile info from sysfs (called once)
+func loadProfileMetadata(firstVF string) []profileMetadata {
+	typesPath := filepath.Join(mdevBusPath, firstVF, "mdev_supported_types")
+	entries, err := os.ReadDir(typesPath)
+	if err != nil {
+		return nil
+	}
+
+	var profiles []profileMetadata
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		typeName := entry.Name()
+		typeDir := filepath.Join(typesPath, typeName)
+
+		nameBytes, err := os.ReadFile(filepath.Join(typeDir, "name"))
+		if err != nil {
+			continue
+		}
+
+		profiles = append(profiles, profileMetadata{
+			TypeName:      typeName,
+			Name:          strings.TrimSpace(string(nameBytes)),
+			FramebufferMB: parseFramebufferFromDescription(typeDir),
+		})
+	}
+
+	return profiles
+}
+
+// parseFramebufferFromDescription extracts framebuffer size from profile description
+func parseFramebufferFromDescription(typeDir string) int {
+	descBytes, err := os.ReadFile(filepath.Join(typeDir, "description"))
+	if err != nil {
+		return 0
+	}
+
+	// Description format varies but typically contains "framebuffer=1024M" or similar
+	desc := string(descBytes)
+
+	// Try to find framebuffer size in MB
+	re := regexp.MustCompile(`framebuffer=(\d+)M`)
+	if matches := re.FindStringSubmatch(desc); len(matches) > 1 {
+		if mb, err := strconv.Atoi(matches[1]); err == nil {
+			return mb
+		}
+	}
+
+	// Also try comma-separated format like "num_heads=4, frl_config=60, framebuffer=1024M"
+	scanner := bufio.NewScanner(strings.NewReader(desc))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "framebuffer") {
+			parts := strings.Split(line, ",")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if strings.HasPrefix(part, "framebuffer=") {
+					sizeStr := strings.TrimPrefix(part, "framebuffer=")
+					sizeStr = strings.TrimSuffix(sizeStr, "M")
+					if mb, err := strconv.Atoi(sizeStr); err == nil {
+						return mb
+					}
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+// countAvailableVFsForProfilesParallel counts available instances for all profiles in parallel.
+// Groups VFs by parent GPU, then sums available_instances across all free VFs.
+// For SR-IOV vGPU, each VF typically has available_instances of 0 or 1.
+func countAvailableVFsForProfilesParallel(vfs []VirtualFunction, profiles []profileMetadata) map[string]int {
+	if len(vfs) == 0 || len(profiles) == 0 {
+		return make(map[string]int)
+	}
+
+	// Group free VFs by parent GPU (done once, shared by all goroutines)
+	freeVFsByParent := make(map[string][]VirtualFunction)
+	for _, vf := range vfs {
+		if vf.Allocated {
+			continue
+		}
+		freeVFsByParent[vf.ParentGPU] = append(freeVFsByParent[vf.ParentGPU], vf)
+	}
+
+	// Count availability for all profiles in parallel
+	results := make(map[string]int, len(profiles))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, meta := range profiles {
+		wg.Add(1)
+		go func(profileType string) {
+			defer wg.Done()
+			count := countAvailableForSingleProfile(freeVFsByParent, profileType)
+			mu.Lock()
+			results[profileType] = count
+			mu.Unlock()
+		}(meta.TypeName)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// countAvailableForSingleProfile counts available VFs for a single profile type.
+// For SR-IOV vGPU (e.g., L40S), each VF has its own available_instances (typically 0 or 1).
+// For time-sliced vGPU, available_instances may reflect shared GPU resources.
+// We sum across all free VFs to handle both cases correctly.
+func countAvailableForSingleProfile(freeVFsByParent map[string][]VirtualFunction, profileType string) int {
+	count := 0
+	for _, parentVFs := range freeVFsByParent {
+		// Sum available_instances from all free VFs on this parent
+		for _, vf := range parentVFs {
+			availPath := filepath.Join(mdevBusPath, vf.PCIAddress, "mdev_supported_types", profileType, "available_instances")
+			data, err := os.ReadFile(availPath)
+			if err != nil {
+				continue
+			}
+			instances, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				continue
+			}
+			count += instances
+		}
+	}
+	return count
+}
+
+// findProfileType finds the internal type name (e.g., "nvidia-556") for a profile name (e.g., "L40S-1Q")
+func findProfileType(profileName string) (string, error) {
+	vfs, err := discoverMdevVFs()
+	if err != nil || len(vfs) == 0 {
+		return "", fmt.Errorf("no VFs available")
+	}
+
+	firstVF := vfs[0].PCIAddress
+	typesPath := filepath.Join(mdevBusPath, firstVF, "mdev_supported_types")
+	entries, err := os.ReadDir(typesPath)
+	if err != nil {
+		return "", fmt.Errorf("read mdev_supported_types: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		typeName := entry.Name()
+		nameBytes, err := os.ReadFile(filepath.Join(typesPath, typeName, "name"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(nameBytes)) == profileName {
+			return typeName, nil
+		}
+	}
+
+	return "", fmt.Errorf("profile %q not found", profileName)
+}
+
+// ListMdevDevices returns all active mdev devices on the host.
+// Scans sysfs directly for fast, consistent results without external process overhead.
+func ListMdevDevices() ([]MdevDevice, error) {
+	entries, err := os.ReadDir(mdevDevices)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read mdev devices: %w", err)
+	}
+
+	var mdevs []MdevDevice
+	for _, entry := range entries {
+		uuid := entry.Name()
+		mdevPath := filepath.Join(mdevDevices, uuid)
+
+		// Read mdev_type symlink to get profile type
+		typeLink, err := os.Readlink(filepath.Join(mdevPath, "mdev_type"))
+		if err != nil {
+			continue
+		}
+		profileType := filepath.Base(typeLink)
+
+		// Get parent VF from symlink
+		parentLink, err := os.Readlink(mdevPath)
+		if err != nil {
+			continue
+		}
+		// Parent path looks like ../../../devices/pci.../0000:82:00.4/uuid
+		parts := strings.Split(parentLink, "/")
+		vfAddress := ""
+		for i, p := range parts {
+			if strings.HasPrefix(p, "0000:") && i+1 < len(parts) && parts[i+1] == uuid {
+				vfAddress = p
+				break
+			}
+		}
+
+		profileName := getProfileNameFromType(profileType, vfAddress)
+
+		mdevs = append(mdevs, MdevDevice{
+			UUID:        uuid,
+			VFAddress:   vfAddress,
+			ProfileType: profileType,
+			ProfileName: profileName,
+			SysfsPath:   mdevPath,
+			InstanceID:  "",
+		})
+	}
+
+	return mdevs, nil
+}
+
+// getProfileNameFromType resolves internal type (nvidia-556) to profile name (L40S-1Q)
+func getProfileNameFromType(profileType, vfAddress string) string {
+	if vfAddress == "" {
+		return profileType // Fallback to type if no VF
+	}
+
+	namePath := filepath.Join(mdevBusPath, vfAddress, "mdev_supported_types", profileType, "name")
+	data, err := os.ReadFile(namePath)
+	if err != nil {
+		return profileType
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// getProfileFramebufferMB returns the framebuffer size in MB for a profile type.
+// Uses cached profile metadata for fast lookup.
+func getProfileFramebufferMB(profileType string) int {
+	cachedProfilesMu.RLock()
+	defer cachedProfilesMu.RUnlock()
+
+	for _, p := range cachedProfiles {
+		if p.TypeName == profileType {
+			return p.FramebufferMB
+		}
+	}
+	return 0
+}
+
+// calculateGPUVRAMUsage calculates VRAM usage per GPU from active mdevs.
+// Returns a map of parentGPU -> usedVRAMMB.
+func calculateGPUVRAMUsage(vfs []VirtualFunction, mdevs []MdevDevice) map[string]int {
+	// Build VF -> parentGPU lookup
+	vfToParent := make(map[string]string, len(vfs))
+	for _, vf := range vfs {
+		vfToParent[vf.PCIAddress] = vf.ParentGPU
+	}
+
+	// Sum framebuffer usage per GPU
+	usageByGPU := make(map[string]int)
+	for _, mdev := range mdevs {
+		parentGPU := vfToParent[mdev.VFAddress]
+		if parentGPU == "" {
+			continue
+		}
+		usageByGPU[parentGPU] += getProfileFramebufferMB(mdev.ProfileType)
+	}
+
+	return usageByGPU
+}
+
+// selectLeastLoadedVF selects a VF from the GPU with the most available VRAM
+// that can create the requested profile. Returns empty string if none available.
+func selectLeastLoadedVF(ctx context.Context, vfs []VirtualFunction, profileType string) string {
+	log := logger.FromContext(ctx)
+
+	// Get active mdevs to calculate VRAM usage
+	mdevs, _ := ListMdevDevices()
+
+	// Calculate VRAM usage per GPU
+	vramUsage := calculateGPUVRAMUsage(vfs, mdevs)
+
+	// Group free VFs by parent GPU
+	freeVFsByGPU := make(map[string][]VirtualFunction)
+	allGPUs := make(map[string]bool)
+	for _, vf := range vfs {
+		allGPUs[vf.ParentGPU] = true
+		if !vf.Allocated {
+			freeVFsByGPU[vf.ParentGPU] = append(freeVFsByGPU[vf.ParentGPU], vf)
+		}
+	}
+
+	// Build list of GPUs sorted by VRAM usage (ascending = least loaded first)
+	type gpuLoad struct {
+		gpu    string
+		usedMB int
+	}
+	var gpuLoads []gpuLoad
+	for gpu := range allGPUs {
+		gpuLoads = append(gpuLoads, gpuLoad{gpu: gpu, usedMB: vramUsage[gpu]})
+	}
+	sort.Slice(gpuLoads, func(i, j int) bool {
+		return gpuLoads[i].usedMB < gpuLoads[j].usedMB
+	})
+
+	log.DebugContext(ctx, "GPU VRAM usage for load balancing",
+		"gpu_count", len(gpuLoads),
+		"profile_type", profileType)
+
+	// Try each GPU in order of least loaded
+	for _, gl := range gpuLoads {
+		freeVFs := freeVFsByGPU[gl.gpu]
+		if len(freeVFs) == 0 {
+			log.DebugContext(ctx, "skipping GPU: no free VFs",
+				"gpu", gl.gpu,
+				"used_mb", gl.usedMB)
+			continue
+		}
+
+		// Check if any free VF on this GPU can create the profile
+		for _, vf := range freeVFs {
+			availPath := filepath.Join(mdevBusPath, vf.PCIAddress, "mdev_supported_types", profileType, "available_instances")
+			data, err := os.ReadFile(availPath)
+			if err != nil {
+				continue
+			}
+			instances, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || instances < 1 {
+				continue
+			}
+
+			log.DebugContext(ctx, "selected VF from least loaded GPU",
+				"vf", vf.PCIAddress,
+				"gpu", gl.gpu,
+				"gpu_used_mb", gl.usedMB)
+			return vf.PCIAddress
+		}
+
+		log.DebugContext(ctx, "skipping GPU: no VF can create profile",
+			"gpu", gl.gpu,
+			"used_mb", gl.usedMB,
+			"profile_type", profileType)
+	}
+
+	return ""
+}
+
+// CreateMdev creates an mdev device for the given profile and instance.
+// It finds an available VF and creates the mdev, returning the device info.
+// This function is thread-safe and uses a mutex to prevent race conditions
+// when multiple instances request vGPUs concurrently.
+func CreateMdev(ctx context.Context, profileName, instanceID string) (*MdevDevice, error) {
+	log := logger.FromContext(ctx)
+
+	// Lock to prevent race conditions when multiple instances request the same profile
+	mdevMu.Lock()
+	defer mdevMu.Unlock()
+
+	// Find profile type from name
+	profileType, err := findProfileType(profileName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Discover all VFs
+	vfs, err := discoverMdevVFs()
+	if err != nil {
+		return nil, fmt.Errorf("discover VFs: %w", err)
+	}
+
+	// Ensure profile cache is populated (needed for VRAM calculation)
+	if len(vfs) > 0 {
+		_ = getCachedProfiles(vfs[0].PCIAddress)
+	}
+
+	// Select VF from the least loaded GPU (by VRAM usage)
+	targetVF := selectLeastLoadedVF(ctx, vfs, profileType)
+	if targetVF == "" {
+		return nil, fmt.Errorf("no available VF for profile %q", profileName)
+	}
+
+	// Generate UUID for the mdev
+	mdevUUID := uuid.New().String()
+
+	log.DebugContext(ctx, "creating mdev device", "profile", profileName, "vf", targetVF, "uuid", mdevUUID, "instance_id", instanceID)
+
+	// Create mdev by writing UUID to create file
+	createPath := filepath.Join(mdevBusPath, targetVF, "mdev_supported_types", profileType, "create")
+	if err := os.WriteFile(createPath, []byte(mdevUUID), 0200); err != nil {
+		return nil, fmt.Errorf("create mdev on VF %s: %w", targetVF, err)
+	}
+
+	log.InfoContext(ctx, "created mdev device", "profile", profileName, "vf", targetVF, "uuid", mdevUUID, "instance_id", instanceID)
+
+	return &MdevDevice{
+		UUID:        mdevUUID,
+		VFAddress:   targetVF,
+		ProfileType: profileType,
+		ProfileName: profileName,
+		SysfsPath:   filepath.Join(mdevDevices, mdevUUID),
+		InstanceID:  instanceID,
+	}, nil
+}
+
+// DestroyMdev removes an mdev device.
+func DestroyMdev(ctx context.Context, mdevUUID string) error {
+	log := logger.FromContext(ctx)
+
+	// Lock to prevent race conditions during destruction
+	mdevMu.Lock()
+	defer mdevMu.Unlock()
+
+	log.DebugContext(ctx, "destroying mdev device", "uuid", mdevUUID)
+
+	// Try mdevctl undefine first (removes persistent definition)
+	if err := exec.Command("mdevctl", "undefine", "--uuid", mdevUUID).Run(); err != nil {
+		// Log at debug level - mdevctl might not be installed or mdev might not be defined
+		log.DebugContext(ctx, "mdevctl undefine failed (may be expected)", "uuid", mdevUUID, "error", err)
+	}
+
+	// Remove via sysfs
+	removePath := filepath.Join(mdevDevices, mdevUUID, "remove")
+	if err := os.WriteFile(removePath, []byte("1"), 0200); err != nil {
+		if os.IsNotExist(err) {
+			log.DebugContext(ctx, "mdev already removed", "uuid", mdevUUID)
+			return nil // Already removed
+		}
+		return fmt.Errorf("remove mdev %s: %w", mdevUUID, err)
+	}
+
+	log.InfoContext(ctx, "destroyed mdev device", "uuid", mdevUUID)
+	return nil
+}
+
+// IsMdevInUse checks if an mdev device is currently bound to a driver (in use by a VM).
+// An mdev with a driver symlink is actively attached to a hypervisor/VFIO.
+func IsMdevInUse(mdevUUID string) bool {
+	driverPath := filepath.Join(mdevDevices, mdevUUID, "driver")
+	_, err := os.Readlink(driverPath)
+	return err == nil // Has a driver = in use
+}
+
+func mdevIOMMUGroup(mdevUUID string) (int, error) {
+	iommuLink := filepath.Join(mdevDevices, mdevUUID, "iommu_group")
+	target, err := os.Readlink(iommuLink)
+	if err != nil {
+		return -1, fmt.Errorf("read iommu_group link: %w", err)
+	}
+
+	groupStr := filepath.Base(target)
+	group, err := strconv.Atoi(groupStr)
+	if err != nil {
+		return -1, fmt.Errorf("parse iommu_group %q: %w", groupStr, err)
+	}
+
+	return group, nil
+}
+
+func isVFIOGroupInUse(group int) (bool, error) {
+	groupPath := filepath.Join(vfioDevicePath, strconv.Itoa(group))
+	if _, err := os.Stat(groupPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat vfio group path %s: %w", groupPath, err)
+	}
+
+	processes, err := os.ReadDir(procPath)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", procPath, err)
+	}
+
+	for _, process := range processes {
+		if !process.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(process.Name()); err != nil {
+			continue // skip non-PID entries
+		}
+
+		fdPath := filepath.Join(procPath, process.Name(), "fd")
+		fds, err := os.ReadDir(fdPath)
+		if err != nil {
+			// Ignore disappearing processes and permission errors while scanning.
+			continue
+		}
+
+		for _, fd := range fds {
+			target, err := os.Readlink(filepath.Join(fdPath, fd.Name()))
+			if err != nil {
+				continue
+			}
+			if target == groupPath {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+func mdevPastGracePeriod(mdevUUID string, gracePeriod time.Duration) (bool, time.Duration, error) {
+	if gracePeriod <= 0 {
+		return true, 0, nil
+	}
+
+	info, err := os.Stat(filepath.Join(mdevDevices, mdevUUID))
+	if err != nil {
+		return false, 0, fmt.Errorf("stat mdev path: %w", err)
+	}
+
+	age := time.Since(info.ModTime())
+	if age < 0 {
+		age = 0
+	}
+
+	return age >= gracePeriod, age, nil
+}
+
+func protectedMdevUUIDs(instanceInfos []MdevReconcileInfo) map[string]struct{} {
+	protected := make(map[string]struct{}, len(instanceInfos))
+	for _, info := range instanceInfos {
+		if info.MdevUUID != "" && info.IsRunning {
+			protected[info.MdevUUID] = struct{}{}
+		}
+	}
+	return protected
+}
+
+// ReconcileMdevs destroys orphaned mdevs on managed VFs.
+//
+// Policy:
+//   - Consider only mdevs whose parent VF is currently managed by hypeman (discoverable via /sys/class/mdev_bus)
+//   - Keep mdevs claimed by live instance metadata
+//   - Keep mdevs whose VFIO group has an open file handle (/dev/vfio/<group>)
+//   - Keep mdevs younger than a short grace period to avoid racing very recent state transitions
+//   - Delete all remaining mdevs
+func ReconcileMdevs(ctx context.Context, instanceInfos []MdevReconcileInfo) error {
+	log := logger.FromContext(ctx)
+	protectedMdevs := protectedMdevUUIDs(instanceInfos)
+
+	vfs, err := discoverMdevVFs()
+	if err != nil {
+		return fmt.Errorf("discover managed VFs: %w", err)
+	}
+	if len(vfs) == 0 {
+		log.DebugContext(ctx, "no managed VFs found, skipping mdev reconciliation")
+		return nil
+	}
+
+	managedVFs := make(map[string]struct{}, len(vfs))
+	for _, vf := range vfs {
+		managedVFs[vf.PCIAddress] = struct{}{}
+	}
+
+	mdevs, err := ListMdevDevices()
+	if err != nil {
+		return fmt.Errorf("list mdevs: %w", err)
+	}
+
+	if len(mdevs) == 0 {
+		log.DebugContext(ctx, "no mdev devices found to reconcile")
+		return nil
+	}
+
+	log.InfoContext(ctx, "reconciling mdev devices",
+		"total_mdevs", len(mdevs),
+		"managed_vfs", len(managedVFs),
+		"grace_period", mdevAssignmentGracePeriod.String(),
+	)
+
+	groupInUseCache := make(map[int]bool)
+	var destroyed, failedDestroy, skippedUnmanagedVF, skippedClaimed, skippedInUse, skippedGrace, skippedProbeError int
+	for _, mdev := range mdevs {
+		if _, ok := managedVFs[mdev.VFAddress]; !ok {
+			log.DebugContext(ctx, "skipping mdev on unmanaged VF", "uuid", mdev.UUID, "vf", mdev.VFAddress)
+			skippedUnmanagedVF++
+			continue
+		}
+		if _, ok := protectedMdevs[mdev.UUID]; ok {
+			log.DebugContext(ctx, "skipping mdev claimed by live instance", "uuid", mdev.UUID)
+			skippedClaimed++
+			continue
+		}
+
+		group, err := mdevIOMMUGroup(mdev.UUID)
+		if err != nil {
+			log.WarnContext(ctx, "failed to resolve mdev VFIO group, skipping cleanup", "uuid", mdev.UUID, "error", err)
+			skippedProbeError++
+			continue
+		}
+
+		inUse, ok := groupInUseCache[group]
+		if !ok {
+			inUse, err = isVFIOGroupInUse(group)
+			if err != nil {
+				log.WarnContext(ctx, "failed to check VFIO group handles, skipping cleanup", "uuid", mdev.UUID, "vfio_group", group, "error", err)
+				skippedProbeError++
+				continue
+			}
+			groupInUseCache[group] = inUse
+		}
+		if inUse {
+			log.DebugContext(ctx, "skipping mdev with active VFIO group handle", "uuid", mdev.UUID, "vfio_group", group)
+			skippedInUse++
+			continue
+		}
+
+		pastGracePeriod, age, err := mdevPastGracePeriod(mdev.UUID, mdevAssignmentGracePeriod)
+		if err != nil {
+			log.WarnContext(ctx, "failed to determine mdev age, skipping cleanup", "uuid", mdev.UUID, "error", err)
+			skippedProbeError++
+			continue
+		}
+		if !pastGracePeriod {
+			log.DebugContext(ctx, "skipping recently created mdev during grace period",
+				"uuid", mdev.UUID,
+				"age", age.String(),
+				"grace_period", mdevAssignmentGracePeriod.String(),
+			)
+			skippedGrace++
+			continue
+		}
+
+		log.InfoContext(ctx, "destroying orphaned mdev",
+			"uuid", mdev.UUID,
+			"profile", mdev.ProfileName,
+			"vf", mdev.VFAddress,
+			"vfio_group", group,
+			"age", age.String(),
+		)
+		if err := DestroyMdev(ctx, mdev.UUID); err != nil {
+			// Log error but continue - best effort cleanup
+			log.WarnContext(ctx, "failed to destroy orphaned mdev", "uuid", mdev.UUID, "error", err)
+			failedDestroy++
+			continue
+		}
+		destroyed++
+	}
+
+	log.InfoContext(ctx, "mdev reconciliation complete",
+		"destroyed", destroyed,
+		"failed_destroy", failedDestroy,
+		"skipped_unmanaged_vf", skippedUnmanagedVF,
+		"skipped_claimed", skippedClaimed,
+		"skipped_in_use", skippedInUse,
+		"skipped_grace", skippedGrace,
+		"skipped_probe_error", skippedProbeError,
+	)
+
+	return nil
+}

@@ -1,0 +1,298 @@
+# yaml-language-server: $schema=https://app.stainless.com/config.schema.json
+
+# The main edition for the config, see the [docs] for more information.
+#
+# [docs]: https://www.stainless.com/docs/reference/editions
+edition: 2025-10-10
+
+organization:
+  name: hypeman
+  # Link to your API documentation.
+  docs: ""
+  # Contact email for bug reports, questions, and support requests.
+  contact: ""
+
+# `targets` define the output targets and their customization options, such as
+# whether to emit the Node SDK and what its package name should be.
+targets:
+  go:
+    # The edition for this target, see the [docs] for more information.
+    #
+    # [docs]: https://www.stainless.com/docs/reference/editions
+    edition: go.2025-10-08
+    package_name: hypeman
+    production_repo: kernel/hypeman-go
+    staging_repo: kernel/hypeman-go-staging
+    publish:
+      release:
+        branch: main
+        prerelease: false
+    options:
+      enable_v2: true
+  python:
+    package_name: hypeman
+    production_repo: kernel/hypeman-python
+    staging_repo: kernel/hypeman-python-staging
+    publish:
+      pypi:
+        auth_method: oidc
+        release_environment: pypi
+      release:
+        branch: main
+        prerelease: false
+    project_name: hypeman
+  typescript:
+    edition: typescript.2025-10-10
+    package_name: "@onkernel/hypeman"
+    production_repo: kernel/hypeman-ts
+    staging_repo: kernel/hypeman-ts-staging
+    publish:
+      npm:
+        auth_method: oidc
+      release:
+        branch: main
+        prerelease: false
+
+# `environments` are a map of the name of the environment (e.g. "sandbox",
+# "production") to the corresponding url to use.
+environments:
+  production: http://localhost:4973
+
+# `resources` define the structure and organization for your API, such as how
+# methods and models are grouped together and accessed. See the [configuration
+# guide] for more information.
+#
+# [configuration guide]: https://www.stainless.com/docs/guides/configure#resources
+resources:
+  $shared:
+    models:
+      snapshot_compression_config: "#/components/schemas/SnapshotCompressionConfig"
+
+  health:
+    # Configure the methods defined in this resource. Each key in the object is the
+    # name of the method and the value is either an endpoint (for example, `get /foo`)
+    # or an object with more detail.
+    #
+    # [reference]: https://www.stainless.com/docs/reference/config#method
+    methods:
+      check: get /health
+
+  capabilities:
+    models:
+      capabilities: "#/components/schemas/Capabilities"
+      capabilities_server: "#/components/schemas/CapabilitiesServer"
+      capabilities_host: "#/components/schemas/CapabilitiesHost"
+      capabilities_default_runtime: "#/components/schemas/CapabilitiesDefaultRuntime"
+      capabilities_runtime: "#/components/schemas/CapabilitiesRuntime"
+      capabilities_network: "#/components/schemas/CapabilitiesNetwork"
+      capabilities_images: "#/components/schemas/CapabilitiesImages"
+    methods:
+      get: get /capabilities
+
+  images:
+    # Configure the models--named types--defined in the resource. Each key in the
+    # object is the name of the model and the value is either the name of a schema in
+    # `#/components/schemas` or an object with more detail.
+    #
+    # [reference]: https://www.stainless.com/docs/reference/config#model
+    models:
+      image: "#/components/schemas/Image"
+      tag_image_request: "#/components/schemas/TagImageRequest"
+    methods:
+      list: get /images
+      create: post /images
+      get: get /images/{name}
+      delete: delete /images/{name}
+      tag: post /images/{name}/tag
+
+  instances:
+    models:
+      auto_standby_policy: "#/components/schemas/AutoStandbyPolicy"
+      auto_standby_status: "#/components/schemas/AutoStandbyStatus"
+      health_check: "#/components/schemas/HealthCheck"
+      health_check_http: "#/components/schemas/HealthCheckHTTP"
+      health_check_tcp: "#/components/schemas/HealthCheckTCP"
+      health_check_exec: "#/components/schemas/HealthCheckExec"
+      instance_health_status: "#/components/schemas/InstanceHealthStatus"
+      restart_policy: "#/components/schemas/RestartPolicy"
+      restart_status: "#/components/schemas/RestartStatus"
+      snapshot_policy: "#/components/schemas/SnapshotPolicy"
+      standby_instance_request: "#/components/schemas/StandbyInstanceRequest"
+      snapshot_schedule: "#/components/schemas/SnapshotSchedule"
+      snapshot_schedule_retention: "#/components/schemas/SnapshotScheduleRetention"
+      set_snapshot_schedule_request: "#/components/schemas/SetSnapshotScheduleRequest"
+      volume_mount: "#/components/schemas/VolumeMount"
+      port_mapping: "#/components/schemas/PortMapping"
+      instance: "#/components/schemas/Instance"
+      path_info: "#/components/schemas/PathInfo"
+      instance_stats: "#/components/schemas/InstanceStats"
+      wait_for_state_response: "#/components/schemas/WaitForStateResponse"
+    methods:
+      list: get /instances
+      create: post /instances
+      get: get /instances/{id}
+      update: patch /instances/{id}
+      delete: delete /instances/{id}
+      standby: post /instances/{id}/standby
+      restore: post /instances/{id}/restore
+      fork: post /instances/{id}/fork
+      start: post /instances/{id}/start
+      stop: post /instances/{id}/stop
+      logs: get /instances/{id}/logs
+      stat: get /instances/{id}/stat
+      stats: get /instances/{id}/stats
+      wait: get /instances/{id}/wait
+    # Subresources define resources that are nested within another for more powerful
+    # logical groupings, e.g. `cards.payments`.
+    subresources:
+      auto_standby:
+        methods:
+          status: get /instances/{id}/auto-standby/status
+          hold: post /instances/{id}/auto-standby/hold
+      volumes:
+        methods:
+          attach: post /instances/{id}/volumes/{volumeId}
+          detach: delete /instances/{id}/volumes/{volumeId}
+      snapshots:
+        methods:
+          create: post /instances/{id}/snapshots
+          restore: post /instances/{id}/snapshots/{snapshotId}/restore
+      snapshot_schedule:
+        methods:
+          get: get /instances/{id}/snapshot-schedule
+          update: put /instances/{id}/snapshot-schedule
+          delete: delete /instances/{id}/snapshot-schedule
+
+  snapshots:
+    models:
+      snapshot: "#/components/schemas/Snapshot"
+      snapshot_kind: "#/components/schemas/SnapshotKind"
+    methods:
+      list: get /snapshots
+      get: get /snapshots/{snapshotId}
+      delete: delete /snapshots/{snapshotId}
+      fork: post /snapshots/{snapshotId}/fork
+
+  volumes:
+    models:
+      volume: "#/components/schemas/Volume"
+      volume_attachment: "#/components/schemas/VolumeAttachment"
+    methods:
+      list: get /volumes
+      create: post /volumes
+      create_from_archive: post /volumes/from-archive
+      get: get /volumes/{id}
+      delete: delete /volumes/{id}
+
+  devices:
+    models:
+      device: "#/components/schemas/Device"
+      available_device: "#/components/schemas/AvailableDevice"
+      device_type: "#/components/schemas/DeviceType"
+    methods:
+      list: get /devices
+      create: post /devices
+      retrieve: get /devices/{id}
+      delete: delete /devices/{id}
+      list_available: get /devices/available
+
+  ingresses:
+    models:
+      ingress: "#/components/schemas/Ingress"
+      ingress_rule: "#/components/schemas/IngressRule"
+      ingress_match: "#/components/schemas/IngressMatch"
+      ingress_target: "#/components/schemas/IngressTarget"
+    methods:
+      list: get /ingresses
+      create: post /ingresses
+      get: get /ingresses/{id}
+      delete: delete /ingresses/{id}
+
+  resources:
+    models:
+      resources: "#/components/schemas/Resources"
+      resource_status: "#/components/schemas/ResourceStatus"
+      resource_allocation: "#/components/schemas/ResourceAllocation"
+      disk_breakdown: "#/components/schemas/DiskBreakdown"
+      gpu_resource_status: "#/components/schemas/GPUResourceStatus"
+      gpu_profile: "#/components/schemas/GPUProfile"
+      passthrough_device: "#/components/schemas/PassthroughDevice"
+      memory_reclaim_request: "#/components/schemas/MemoryReclaimRequest"
+      memory_reclaim_action: "#/components/schemas/MemoryReclaimAction"
+      memory_reclaim_response: "#/components/schemas/MemoryReclaimResponse"
+    methods:
+      get: get /resources
+      reclaim_memory: post /resources/memory/reclaim
+
+  builders:
+    models:
+      builder: "#/components/schemas/Builder"
+      builder_status: "#/components/schemas/BuilderStatus"
+    methods:
+      list: get /builders
+      create: post /builders
+      get: get /builders/{id}
+      delete: delete /builders/{id}
+      prune: post /builders/{id}/prune
+
+  builds:
+    models:
+      build: "#/components/schemas/Build"
+      build_status: "#/components/schemas/BuildStatus"
+      build_policy: "#/components/schemas/BuildPolicy"
+      build_provenance: "#/components/schemas/BuildProvenance"
+      build_event: "#/components/schemas/BuildEvent"
+    methods:
+      list: get /builds
+      create: post /builds
+      get: get /builds/{id}
+      cancel: delete /builds/{id}
+      events: get /builds/{id}/events
+
+  pushes:
+    models:
+      push: "#/components/schemas/Push"
+      push_status: "#/components/schemas/PushStatus"
+      push_credentials: "#/components/schemas/PushCredentials"
+      create_push_request: "#/components/schemas/CreatePushRequest"
+    methods:
+      list: get /pushes
+      create: post /pushes
+      get: get /pushes/{id}
+
+settings:
+  # All generated integration tests that hit the prism mock http server are marked
+  # as skipped. Removing this setting or setting it to false enables tests, but
+  # doing so may result in test failures due to bugs in the test server.
+  #
+  # [prism mock http server]: https://stoplight.io/open-source/prism
+  disable_mock_tests: true
+  license: Apache-2.0
+
+# `client_settings` define settings for the API client, such as extra constructor
+# arguments (used for authentication), retry behavior, idempotency, etc.
+client_settings:
+  opts:
+    api_key:
+      type: string
+      nullable: false
+      auth:
+        security_scheme: bearerAuth
+      read_env: HYPEMAN_API_KEY
+
+security:
+  - bearerAuth: []
+
+# `readme` is used to configure the code snippets that will be rendered in the
+# README.md of various SDKs. In particular, you can change the `headline`
+# snippet's endpoint and the arguments to call it with.
+readme:
+  example_requests:
+    default:
+      type: request
+      endpoint: get /health
+      params: {}
+    headline:
+      type: request
+      endpoint: get /health
+      params: {}

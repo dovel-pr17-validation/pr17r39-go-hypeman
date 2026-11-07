@@ -1,0 +1,1432 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/c2h5oh/datasize"
+	"github.com/kernel/hypeman/lib/guest"
+	"github.com/kernel/hypeman/lib/healthcheck"
+	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/instances"
+	"github.com/kernel/hypeman/lib/logger"
+	mw "github.com/kernel/hypeman/lib/middleware"
+	"github.com/kernel/hypeman/lib/network"
+	"github.com/kernel/hypeman/lib/oapi"
+	"github.com/kernel/hypeman/lib/resources"
+	"github.com/kernel/hypeman/lib/snapshot"
+	"github.com/kernel/hypeman/lib/vm_metrics"
+	"github.com/samber/lo"
+)
+
+// ListInstances lists instances, optionally filtered by state and/or tags.
+func (s *ApiService) ListInstances(ctx context.Context, request oapi.ListInstancesRequestObject) (oapi.ListInstancesResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	// Convert OAPI params to domain filter
+	var filter *instances.ListInstancesFilter
+	if request.Params.State != nil || request.Params.Tags != nil {
+		filter = &instances.ListInstancesFilter{}
+		if request.Params.State != nil {
+			state := instances.State(*request.Params.State)
+			filter.State = &state
+		}
+		if request.Params.Tags != nil {
+			filter.Tags = toMapTags(request.Params.Tags)
+		}
+	}
+
+	domainInsts, err := s.InstanceManager.ListInstances(ctx, filter)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to list instances", "error", err)
+		return oapi.ListInstances500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to list instances",
+		}, nil
+	}
+
+	oapiInsts := make([]oapi.Instance, len(domainInsts))
+	for i, inst := range domainInsts {
+		oapiInsts[i] = instanceToOAPI(inst)
+	}
+
+	return oapi.ListInstances200JSONResponse(oapiInsts), nil
+}
+
+// CreateInstance creates and starts a new instance
+func (s *ApiService) CreateInstance(ctx context.Context, request oapi.CreateInstanceRequestObject) (oapi.CreateInstanceResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	macOSCreate, err := s.isMacOSImage(ctx, request.Body.Image)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to look up image for create", "error", err, "image", request.Body.Image)
+		return oapi.CreateInstance500JSONResponse{Code: "internal_error", Message: "failed to look up image"}, nil
+	}
+	if macOSCreate {
+		ignoreLinuxCreateDefaults(ctx, request.Body)
+	}
+
+	// Parse size (default: 1GB)
+	size := int64(0)
+	if request.Body.Size != nil && *request.Body.Size != "" {
+		var sizeBytes datasize.ByteSize
+		if err := sizeBytes.UnmarshalText([]byte(*request.Body.Size)); err != nil {
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_size",
+				Message: fmt.Sprintf("invalid size format: %v", err),
+			}, nil
+		}
+		size = int64(sizeBytes)
+	}
+
+	// Parse hotplug_size (optional; omitted/empty means no hotplug memory)
+	hotplugSize := int64(0)
+	if request.Body.HotplugSize != nil && *request.Body.HotplugSize != "" {
+		var hotplugBytes datasize.ByteSize
+		if err := hotplugBytes.UnmarshalText([]byte(*request.Body.HotplugSize)); err != nil {
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_hotplug_size",
+				Message: fmt.Sprintf("invalid hotplug_size format: %v", err),
+			}, nil
+		}
+		hotplugSize = int64(hotplugBytes)
+	}
+
+	// Parse overlay_size (default: 10GB)
+	overlaySize := int64(0)
+	if request.Body.OverlaySize != nil && *request.Body.OverlaySize != "" {
+		var overlayBytes datasize.ByteSize
+		if err := overlayBytes.UnmarshalText([]byte(*request.Body.OverlaySize)); err != nil {
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_overlay_size",
+				Message: fmt.Sprintf("invalid overlay_size format: %v", err),
+			}, nil
+		}
+		overlaySize = int64(overlayBytes)
+	}
+
+	// Parse disk_io_bps (0 = auto/unlimited)
+	diskIOBps := int64(0)
+	if request.Body.DiskIoBps != nil && *request.Body.DiskIoBps != "" {
+		var ioBpsBytes datasize.ByteSize
+		// Remove "/s" suffix if present
+		ioStr := *request.Body.DiskIoBps
+		ioStr = strings.TrimSuffix(ioStr, "/s")
+		ioStr = strings.TrimSuffix(ioStr, "ps")
+		if err := ioBpsBytes.UnmarshalText([]byte(ioStr)); err != nil {
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_disk_io_bps",
+				Message: fmt.Sprintf("invalid disk_io_bps format: %v", err),
+			}, nil
+		}
+		diskIOBps = int64(ioBpsBytes)
+	}
+
+	vcpus := 2
+	if request.Body.Vcpus != nil {
+		vcpus = *request.Body.Vcpus
+	}
+
+	env := make(map[string]string)
+	if request.Body.Env != nil {
+		env = *request.Body.Env
+	}
+
+	resourceTags := make(map[string]string)
+	if request.Body.Tags != nil {
+		resourceTags = toMapTags(request.Body.Tags)
+	}
+
+	if request.Body.Ttl != nil && request.Body.ExpiresAt != nil {
+		return oapi.CreateInstance400JSONResponse{
+			Code:    "invalid_request",
+			Message: "ttl and expires_at are mutually exclusive",
+		}, nil
+	}
+	var ttl *time.Duration
+	if request.Body.Ttl != nil {
+		parsedTTL, err := parseTTL(*request.Body.Ttl)
+		if err != nil {
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_ttl",
+				Message: err.Error(),
+			}, nil
+		}
+		ttl = &parsedTTL
+	}
+
+	// Parse network enabled (default: true)
+	networkEnabled := true
+	if request.Body.Network != nil && request.Body.Network.Enabled != nil {
+		networkEnabled = *request.Body.Network.Enabled
+	}
+	var networkEgress *instances.NetworkEgressPolicy
+	if request.Body.Network != nil && request.Body.Network.Egress != nil {
+		enabled := request.Body.Network.Egress.Enabled != nil && *request.Body.Network.Egress.Enabled
+		networkEgress = &instances.NetworkEgressPolicy{Enabled: enabled}
+		if request.Body.Network.Egress.Enforcement != nil && request.Body.Network.Egress.Enforcement.Mode != nil {
+			networkEgress.EnforcementMode = instances.EgressEnforcementMode(*request.Body.Network.Egress.Enforcement.Mode)
+		} else if enabled {
+			networkEgress.EnforcementMode = instances.EgressEnforcementModeAll
+		}
+	}
+	var credentials map[string]instances.CredentialPolicy
+	if request.Body.Credentials != nil {
+		credentials = make(map[string]instances.CredentialPolicy, len(*request.Body.Credentials))
+		for credentialName, credential := range *request.Body.Credentials {
+			policy := instances.CredentialPolicy{
+				Source: instances.CredentialSource{
+					Env: credential.Source.Env,
+				},
+				Inject: make([]instances.CredentialInjectRule, 0, len(credential.Inject)),
+			}
+			for _, inject := range credential.Inject {
+				rule := instances.CredentialInjectRule{
+					As: instances.CredentialInjectAs{
+						Header: inject.As.Header,
+						Format: inject.As.Format,
+					},
+				}
+				if inject.Hosts != nil {
+					rule.Hosts = append([]string(nil), (*inject.Hosts)...)
+				}
+				policy.Inject = append(policy.Inject, rule)
+			}
+			credentials[credentialName] = policy
+		}
+	}
+
+	// Parse network bandwidth limits (0 = auto)
+	// Supports both bit-based (e.g., "1Gbps") and byte-based (e.g., "125MB/s") formats
+	var networkBandwidthDownload int64
+	var networkBandwidthUpload int64
+	if request.Body.Network != nil {
+		if request.Body.Network.BandwidthDownload != nil && *request.Body.Network.BandwidthDownload != "" {
+			bw, err := resources.ParseBandwidth(*request.Body.Network.BandwidthDownload)
+			if err != nil {
+				return oapi.CreateInstance400JSONResponse{
+					Code:    "invalid_bandwidth_download",
+					Message: fmt.Sprintf("invalid bandwidth_download format: %v", err),
+				}, nil
+			}
+			networkBandwidthDownload = bw
+		}
+		if request.Body.Network.BandwidthUpload != nil && *request.Body.Network.BandwidthUpload != "" {
+			bw, err := resources.ParseBandwidth(*request.Body.Network.BandwidthUpload)
+			if err != nil {
+				return oapi.CreateInstance400JSONResponse{
+					Code:    "invalid_bandwidth_upload",
+					Message: fmt.Sprintf("invalid bandwidth_upload format: %v", err),
+				}, nil
+			}
+			networkBandwidthUpload = bw
+		}
+	}
+
+	// Parse devices (GPU passthrough)
+	var deviceRefs []string
+	if request.Body.Devices != nil {
+		deviceRefs = *request.Body.Devices
+	}
+
+	// Parse volumes
+	var volumes []instances.VolumeAttachment
+	if request.Body.Volumes != nil {
+		volumes = make([]instances.VolumeAttachment, len(*request.Body.Volumes))
+		for i, vol := range *request.Body.Volumes {
+			readonly := false
+			if vol.Readonly != nil {
+				readonly = *vol.Readonly
+			}
+			overlay := false
+			if vol.Overlay != nil {
+				overlay = *vol.Overlay
+			}
+			var overlaySize int64
+			if vol.OverlaySize != nil && *vol.OverlaySize != "" {
+				var overlaySizeBytes datasize.ByteSize
+				if err := overlaySizeBytes.UnmarshalText([]byte(*vol.OverlaySize)); err != nil {
+					return oapi.CreateInstance400JSONResponse{
+						Code:    "invalid_overlay_size",
+						Message: fmt.Sprintf("invalid overlay_size for volume %s: %v", vol.VolumeId, err),
+					}, nil
+				}
+				overlaySize = int64(overlaySizeBytes)
+			}
+			volumes[i] = instances.VolumeAttachment{
+				VolumeID:    vol.VolumeId,
+				MountPath:   vol.MountPath,
+				Readonly:    readonly,
+				Overlay:     overlay,
+				OverlaySize: overlaySize,
+			}
+		}
+	}
+
+	// Convert hypervisor type from API enum to domain type
+	var hvType hypervisor.Type
+	if request.Body.Hypervisor != nil {
+		hvType = hypervisor.Type(*request.Body.Hypervisor)
+	}
+	// Parse GPU configuration (vGPU mode)
+	var gpuConfig *instances.GPUConfig
+	if request.Body.Gpu != nil && request.Body.Gpu.Profile != nil && *request.Body.Gpu.Profile != "" {
+		gpuConfig = &instances.GPUConfig{
+			Profile: *request.Body.Gpu.Profile,
+		}
+	}
+
+	// macOS guests take CPU and memory from their image and have no I/O shaping.
+	if macOSCreate && request.Body.Vcpus == nil {
+		vcpus = 0
+	}
+
+	// Calculate default resource limits when not specified (0 = auto)
+	// Uses proportional allocation based on CPU: (vcpus / cpuCapacity) * resourceCapacity
+	if !macOSCreate && diskIOBps == 0 {
+		diskIOBps, _ = s.ResourceManager.DefaultDiskIOBandwidth(vcpus)
+	}
+	if !macOSCreate && (networkBandwidthDownload == 0 || networkBandwidthUpload == 0) {
+		defaultDown, defaultUp := s.ResourceManager.DefaultNetworkBandwidth(vcpus)
+		if networkBandwidthDownload == 0 {
+			networkBandwidthDownload = defaultDown
+		}
+		if networkBandwidthUpload == 0 {
+			networkBandwidthUpload = defaultUp
+		}
+	}
+
+	// Parse command overrides (like docker run --entrypoint / docker run <image> <command>)
+	var entrypoint []string
+	if request.Body.Entrypoint != nil {
+		entrypoint = *request.Body.Entrypoint
+	}
+	var cmd []string
+	if request.Body.Cmd != nil {
+		cmd = *request.Body.Cmd
+	}
+	autoStandby, err := toDomainAutoStandbyPolicy(request.Body.AutoStandby)
+	if err != nil {
+		return oapi.CreateInstance400JSONResponse{
+			Code:    "invalid_auto_standby",
+			Message: err.Error(),
+		}, nil
+	}
+	healthCheck, err := toDomainHealthCheck(request.Body.HealthCheck)
+	if err != nil {
+		return oapi.CreateInstance400JSONResponse{
+			Code:    "invalid_health_check",
+			Message: err.Error(),
+		}, nil
+	}
+	restartPolicy, err := toDomainRestartPolicy(request.Body.RestartPolicy)
+	if err != nil {
+		return oapi.CreateInstance400JSONResponse{
+			Code:    "invalid_restart_policy",
+			Message: err.Error(),
+		}, nil
+	}
+
+	domainReq := instances.CreateInstanceRequest{
+		Name:                     request.Body.Name,
+		Image:                    request.Body.Image,
+		Size:                     size,
+		Platform:                 derefString(request.Body.Platform),
+		HotplugSize:              hotplugSize,
+		OverlaySize:              overlaySize,
+		Vcpus:                    vcpus,
+		DiskIOBps:                diskIOBps,
+		NetworkBandwidthDownload: networkBandwidthDownload,
+		NetworkBandwidthUpload:   networkBandwidthUpload,
+		Env:                      env,
+		Tags:                     resourceTags,
+		TTL:                      ttl,
+		ExpiresAt:                request.Body.ExpiresAt,
+		NetworkEnabled:           networkEnabled,
+		NetworkEgress:            networkEgress,
+		Credentials:              credentials,
+		Devices:                  deviceRefs,
+		Volumes:                  volumes,
+		Hypervisor:               hvType,
+		GPU:                      gpuConfig,
+		Entrypoint:               entrypoint,
+		Cmd:                      cmd,
+		SkipKernelHeaders:        request.Body.SkipKernelHeaders != nil && *request.Body.SkipKernelHeaders,
+		SkipGuestAgent:           request.Body.SkipGuestAgent != nil && *request.Body.SkipGuestAgent,
+		AutoStandby:              autoStandby,
+		HealthCheck:              healthCheck,
+		RestartPolicy:            restartPolicy,
+	}
+	if request.Body.SnapshotPolicy != nil {
+		snapshotPolicy, err := toInstanceSnapshotPolicy(*request.Body.SnapshotPolicy)
+		if err != nil {
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_snapshot_policy",
+				Message: err.Error(),
+			}, nil
+		}
+		domainReq.SnapshotPolicy = snapshotPolicy
+	}
+
+	inst, err := s.InstanceManager.CreateInstance(ctx, domainReq)
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrImageNotReady):
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "image_not_ready",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrAlreadyExists):
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "already_exists",
+				Message: "instance already exists",
+			}, nil
+		case errors.Is(err, network.ErrNameExists):
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "name_conflict",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInsufficientResources):
+			return oapi.CreateInstance409JSONResponse{
+				Code:    "insufficient_resources",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidExpiresAt):
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_expires_at",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidRequest):
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, images.ErrInvalidPlatform):
+			return oapi.CreateInstance400JSONResponse{
+				Code:    "invalid_platform",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, images.ErrPlatformNotAvailable):
+			return oapi.CreateInstance404JSONResponse{
+				Code:    "platform_not_available",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, images.ErrRateLimited):
+			return oapi.CreateInstance429JSONResponse{
+				Code:    "rate_limited",
+				Message: images.RateLimitMessage,
+			}, nil
+		case errors.Is(err, images.ErrNotFound):
+			return oapi.CreateInstance404JSONResponse{
+				Code:    "not_found",
+				Message: err.Error(),
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to create instance", "error", err, "image", request.Body.Image)
+			return oapi.CreateInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to create instance",
+			}, nil
+		}
+	}
+	return oapi.CreateInstance201JSONResponse(instanceToOAPI(*inst)), nil
+}
+
+// GetInstance gets instance details
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) GetInstance(ctx context.Context, request oapi.GetInstanceRequestObject) (oapi.GetInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.GetInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	return oapi.GetInstance200JSONResponse(instanceToOAPI(*inst)), nil
+}
+
+// GetInstanceStats returns resource utilization statistics for an instance
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) GetInstanceStats(ctx context.Context, request oapi.GetInstanceStatsRequestObject) (oapi.GetInstanceStatsResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.GetInstanceStats500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+
+	// Build instance info for metrics collection
+	info := vm_metrics.BuildInstanceInfo(
+		inst.Id,
+		inst.Name,
+		inst.HypervisorPID,
+		inst.NetworkEnabled,
+		inst.Vcpus,
+		inst.Size+inst.HotplugSize,
+	)
+	info.StoragePath = inst.VMStoragePath()
+
+	// Collect stats using vm_metrics manager
+	vmStats := s.VMMetricsManager.GetInstanceStats(ctx, info)
+
+	// Map domain type to API type
+	return oapi.GetInstanceStats200JSONResponse(vmStatsToOAPI(vmStats)), nil
+}
+
+// vmStatsToOAPI converts vm_metrics.VMStats to oapi.InstanceStats
+func vmStatsToOAPI(s *vm_metrics.VMStats) oapi.InstanceStats {
+	stats := oapi.InstanceStats{
+		InstanceId:             s.InstanceID,
+		InstanceName:           s.InstanceName,
+		CpuSeconds:             s.CPUSeconds(),
+		MemoryRssBytes:         int64(s.MemoryRSSBytes),
+		MemoryVmsBytes:         int64(s.MemoryVMSBytes),
+		NetworkRxBytes:         int64(s.NetRxBytes),
+		NetworkTxBytes:         int64(s.NetTxBytes),
+		AllocatedVcpus:         s.AllocatedVcpus,
+		AllocatedMemoryBytes:   s.AllocatedMemoryBytes,
+		MemoryUtilizationRatio: s.MemoryUtilizationRatio(),
+	}
+	return stats
+}
+
+// validWaitTargetStates is the set of states callers may wait for.
+var validWaitTargetStates = map[oapi.InstanceState]bool{
+	oapi.InstanceStateCreated:      true,
+	oapi.InstanceStateInitializing: true,
+	oapi.InstanceStateRunning:      true,
+	oapi.InstanceStatePaused:       true,
+	oapi.InstanceStateShutdown:     true,
+	oapi.InstanceStateStopped:      true,
+	oapi.InstanceStateStandby:      true,
+}
+
+// WaitForInstanceState blocks until an instance reaches the target state,
+// the timeout expires, or a terminal/error state is detected.
+// Note: Resolution is handled by ResolveResource middleware.
+func (s *ApiService) WaitForInstanceState(ctx context.Context, request oapi.WaitForInstanceStateRequestObject) (oapi.WaitForInstanceStateResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.WaitForInstanceState500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+
+	targetState := request.Params.State
+	if !validWaitTargetStates[targetState] {
+		return oapi.WaitForInstanceState400JSONResponse{
+			Code:    "invalid_state",
+			Message: fmt.Sprintf("invalid target state: %s", targetState),
+		}, nil
+	}
+
+	timeout := instances.WaitForStateDefaultTimeout
+	if request.Params.Timeout != nil && *request.Params.Timeout != "" {
+		parsed, err := time.ParseDuration(*request.Params.Timeout)
+		if err != nil {
+			return oapi.WaitForInstanceState400JSONResponse{
+				Code:    "invalid_timeout",
+				Message: fmt.Sprintf("invalid timeout format: %v", err),
+			}, nil
+		}
+		if parsed <= 0 {
+			return oapi.WaitForInstanceState400JSONResponse{
+				Code:    "invalid_timeout",
+				Message: "timeout must be positive",
+			}, nil
+		}
+		if parsed > instances.WaitForStateMaxTimeout {
+			parsed = instances.WaitForStateMaxTimeout
+		}
+		timeout = parsed
+	}
+
+	result, err := instances.WaitForState(ctx, s.InstanceManager, inst, instances.State(targetState), timeout)
+	if err != nil {
+		if errors.Is(err, instances.ErrNotFound) {
+			return oapi.WaitForInstanceState404JSONResponse{
+				Code:    "not_found",
+				Message: "instance was deleted while waiting",
+			}, nil
+		}
+		return oapi.WaitForInstanceState500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed waiting for instance state",
+		}, nil
+	}
+
+	return oapi.WaitForInstanceState200JSONResponse{
+		State:      oapi.InstanceState(result.State),
+		StateError: result.StateError,
+		TimedOut:   result.TimedOut,
+	}, nil
+}
+
+// DeleteInstance stops and deletes an instance
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) DeleteInstance(ctx context.Context, request oapi.DeleteInstanceRequestObject) (oapi.DeleteInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.DeleteInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	options := instances.DeleteInstanceOptions{}
+	if request.Params.GracefulShutdown != nil {
+		options.SkipGracefulShutdown = !*request.Params.GracefulShutdown
+	}
+
+	err := s.InstanceManager.DeleteInstanceWithOptions(ctx, inst.Id, options)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to delete instance", "error", err)
+		return oapi.DeleteInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to delete instance",
+		}, nil
+	}
+	return oapi.DeleteInstance204Response{}, nil
+}
+
+// StandbyInstance puts an instance in standby (pause, snapshot, delete VMM)
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) StandbyInstance(ctx context.Context, request oapi.StandbyInstanceRequestObject) (oapi.StandbyInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.StandbyInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	standbyReq := instances.StandbyInstanceRequest{}
+	if request.Body != nil && request.Body.Compression != nil {
+		compression, err := toDomainSnapshotCompressionConfig(*request.Body.Compression)
+		if err != nil {
+			return oapi.StandbyInstance400JSONResponse{
+				Code:    "invalid_snapshot_compression",
+				Message: err.Error(),
+			}, nil
+		}
+		standbyReq.Compression = compression
+	}
+	if request.Body != nil && request.Body.CompressionDelay != nil {
+		compressionDelay, err := parseOptionalDuration(*request.Body.CompressionDelay, "compression_delay")
+		if err != nil {
+			return oapi.StandbyInstance400JSONResponse{
+				Code:    "invalid_compression_delay",
+				Message: err.Error(),
+			}, nil
+		}
+		standbyReq.CompressionDelay = compressionDelay
+	}
+
+	result, err := s.InstanceManager.StandbyInstance(ctx, inst.Id, standbyReq)
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrInvalidRequest):
+			return oapi.StandbyInstance400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidState):
+			return oapi.StandbyInstance409JSONResponse{
+				Code:    "invalid_state",
+				Message: err.Error(),
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to standby instance", "error", err)
+			return oapi.StandbyInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to standby instance",
+			}, nil
+		}
+	}
+	return oapi.StandbyInstance200JSONResponse(instanceToOAPI(*result)), nil
+}
+
+// RestoreInstance restores an instance from standby
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) RestoreInstance(ctx context.Context, request oapi.RestoreInstanceRequestObject) (oapi.RestoreInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.RestoreInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	result, err := s.InstanceManager.RestoreInstance(ctx, inst.Id)
+	if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			log.DebugContext(ctx, "restore request canceled")
+			return oapi.RestoreInstance499JSONResponse{
+				Code:    "client_closed_request",
+				Message: "request canceled",
+			}, nil
+		case errors.Is(err, instances.ErrNotFound):
+			return oapi.RestoreInstance404JSONResponse{
+				Code:    "not_found",
+				Message: "instance not found",
+			}, nil
+		case errors.Is(err, instances.ErrInvalidRequest):
+			return oapi.RestoreInstance400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidState):
+			return oapi.RestoreInstance409JSONResponse{
+				Code:    "invalid_state",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInsufficientResources):
+			return oapi.RestoreInstance409JSONResponse{
+				Code:    "insufficient_resources",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, images.ErrNotFound):
+			return oapi.RestoreInstance404JSONResponse{
+				Code:    "not_found",
+				Message: "instance image not found",
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to restore instance", "error", err)
+			return oapi.RestoreInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to restore instance",
+			}, nil
+		}
+	}
+	return oapi.RestoreInstance200JSONResponse(instanceToOAPI(*result)), nil
+}
+
+// ForkInstance forks an instance from stopped or standby into a new instance.
+// The id parameter can be an instance ID, name, or ID prefix.
+// Note: Resolution is handled by ResolveResource middleware.
+func (s *ApiService) ForkInstance(ctx context.Context, request oapi.ForkInstanceRequestObject) (oapi.ForkInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.ForkInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	if request.Body == nil {
+		return oapi.ForkInstance400JSONResponse{
+			Code:    "invalid_request",
+			Message: "request body is required",
+		}, nil
+	}
+
+	targetState := instances.State("")
+	if request.Body.TargetState != nil {
+		targetState = instances.State(*request.Body.TargetState)
+	}
+
+	result, err := s.InstanceManager.ForkInstance(ctx, inst.Id, instances.ForkInstanceRequest{
+		Name:        request.Body.Name,
+		FromRunning: request.Body.FromRunning != nil && *request.Body.FromRunning,
+		TargetState: targetState,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrNotFound):
+			return oapi.ForkInstance404JSONResponse{
+				Code:    "not_found",
+				Message: "instance not found",
+			}, nil
+		case errors.Is(err, instances.ErrInvalidState):
+			return oapi.ForkInstance409JSONResponse{
+				Code:    "invalid_state",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidRequest):
+			return oapi.ForkInstance400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrAlreadyExists), errors.Is(err, network.ErrNameExists):
+			return oapi.ForkInstance409JSONResponse{
+				Code:    "name_conflict",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInsufficientResources):
+			return oapi.ForkInstance409JSONResponse{
+				Code:    "insufficient_resources",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrNotSupported):
+			return oapi.ForkInstance501JSONResponse{
+				Code:    "not_supported",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, images.ErrNotFound):
+			return oapi.ForkInstance404JSONResponse{
+				Code:    "not_found",
+				Message: "instance image not found",
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to fork instance", "error", err)
+			return oapi.ForkInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to fork instance",
+			}, nil
+		}
+	}
+	return oapi.ForkInstance201JSONResponse(instanceToOAPI(*result)), nil
+}
+
+// StopInstance gracefully stops a running instance
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) StopInstance(ctx context.Context, request oapi.StopInstanceRequestObject) (oapi.StopInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.StopInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	result, err := s.InstanceManager.StopInstance(ctx, inst.Id)
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrInvalidState):
+			return oapi.StopInstance409JSONResponse{
+				Code:    "invalid_state",
+				Message: err.Error(),
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to stop instance", "error", err)
+			return oapi.StopInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to stop instance",
+			}, nil
+		}
+	}
+	return oapi.StopInstance200JSONResponse(instanceToOAPI(*result)), nil
+}
+
+// StartInstance starts a stopped instance
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) StartInstance(ctx context.Context, request oapi.StartInstanceRequestObject) (oapi.StartInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.StartInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	// Parse optional command overrides from request body
+	var startReq instances.StartInstanceRequest
+	if request.Body != nil {
+		if request.Body.Entrypoint != nil {
+			startReq.Entrypoint = *request.Body.Entrypoint
+		}
+		if request.Body.Cmd != nil {
+			startReq.Cmd = *request.Body.Cmd
+		}
+	}
+
+	result, err := s.InstanceManager.StartInstance(ctx, inst.Id, startReq)
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrInvalidState):
+			return oapi.StartInstance409JSONResponse{
+				Code:    "invalid_state",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInsufficientResources):
+			return oapi.StartInstance409JSONResponse{
+				Code:    "insufficient_resources",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, images.ErrNotFound):
+			return oapi.StartInstance404JSONResponse{
+				Code:    "not_found",
+				Message: "instance image not found",
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to start instance", "error", err)
+			return oapi.StartInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to start instance",
+			}, nil
+		}
+	}
+	return oapi.StartInstance200JSONResponse(instanceToOAPI(*result)), nil
+}
+
+// logsStreamResponse implements oapi.GetInstanceLogsResponseObject with proper SSE flushing
+type logsStreamResponse struct {
+	logChan <-chan string
+}
+
+func (r logsStreamResponse) VisitGetInstanceLogsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	w.WriteHeader(200)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming not supported")
+	}
+
+	for line := range r.logChan {
+		jsonLine, _ := json.Marshal(line)
+		fmt.Fprintf(w, "data: %s\n\n", jsonLine)
+		flusher.Flush()
+	}
+	return nil
+}
+
+// GetInstanceLogs streams instance logs via SSE
+// With follow=false (default), streams last N lines then closes
+// With follow=true, streams last N lines then continues following new output
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) GetInstanceLogs(ctx context.Context, request oapi.GetInstanceLogsRequestObject) (oapi.GetInstanceLogsResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.GetInstanceLogs500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+
+	tail := 100
+	if request.Params.Tail != nil {
+		tail = *request.Params.Tail
+	}
+
+	follow := false
+	if request.Params.Follow != nil {
+		follow = *request.Params.Follow
+	}
+
+	// Map source parameter to LogSource type (default to app)
+	source := instances.LogSourceApp
+	if request.Params.Source != nil {
+		switch *request.Params.Source {
+		case oapi.App:
+			source = instances.LogSourceApp
+		case oapi.Vmm:
+			source = instances.LogSourceVMM
+		case oapi.Hypeman:
+			source = instances.LogSourceHypeman
+		case oapi.Swtpm:
+			source = instances.LogSourceSWTPM
+		}
+	}
+
+	logChan, err := s.InstanceManager.StreamInstanceLogs(ctx, inst.Id, tail, follow, source)
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrTailNotFound):
+			return oapi.GetInstanceLogs500JSONResponse{
+				Code:    "dependency_missing",
+				Message: "tail command not found on server - required for log streaming",
+			}, nil
+		case errors.Is(err, instances.ErrLogNotFound):
+			return oapi.GetInstanceLogs404JSONResponse{
+				Code:    "log_not_found",
+				Message: "requested log file does not exist yet",
+			}, nil
+		case errors.Is(err, instances.ErrNotSupported):
+			return oapi.GetInstanceLogs501JSONResponse{
+				Code:    "not_supported",
+				Message: err.Error(),
+			}, nil
+		default:
+			return oapi.GetInstanceLogs500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to stream logs",
+			}, nil
+		}
+	}
+
+	return logsStreamResponse{logChan: logChan}, nil
+}
+
+// StatInstancePath returns information about a path in the guest filesystem
+// The id parameter can be an instance ID, name, or ID prefix
+// Note: Resolution is handled by ResolveResource middleware
+func (s *ApiService) StatInstancePath(ctx context.Context, request oapi.StatInstancePathRequestObject) (oapi.StatInstancePathResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.StatInstancePath500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+
+	if inst.MacOS != nil {
+		return oapi.StatInstancePath501JSONResponse{
+			Code:    "unsupported",
+			Message: "stat is not implemented for experimental macOS instances",
+		}, nil
+	}
+
+	if inst.State != instances.StateRunning {
+		return oapi.StatInstancePath409JSONResponse{
+			Code:    "invalid_state",
+			Message: fmt.Sprintf("instance must be running (current state: %s)", inst.State),
+		}, nil
+	}
+
+	dialer, err := s.InstanceManager.GetVsockDialer(ctx, inst.Id)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to get vsock dialer", "error", err)
+		return oapi.StatInstancePath500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to get vsock dialer",
+		}, nil
+	}
+
+	grpcConn, err := guest.GetOrCreateConn(ctx, dialer)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to get grpc connection", "error", err)
+		return oapi.StatInstancePath500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to connect to guest agent",
+		}, nil
+	}
+
+	client := guest.NewGuestServiceClient(grpcConn)
+	followLinks := false
+	if request.Params.FollowLinks != nil {
+		followLinks = *request.Params.FollowLinks
+	}
+
+	resp, err := client.StatPath(ctx, &guest.StatPathRequest{
+		Path:        request.Params.Path,
+		FollowLinks: followLinks,
+	})
+	if err != nil {
+		log.ErrorContext(ctx, "stat path failed", "error", err, "path", request.Params.Path)
+		return oapi.StatInstancePath500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to stat path in guest",
+		}, nil
+	}
+
+	// Convert types from protobuf to OAPI
+	mode := int(resp.Mode)
+	response := oapi.StatInstancePath200JSONResponse{
+		Exists:     resp.Exists,
+		IsDir:      &resp.IsDir,
+		IsFile:     &resp.IsFile,
+		IsSymlink:  &resp.IsSymlink,
+		LinkTarget: &resp.LinkTarget,
+		Mode:       &mode,
+		Size:       &resp.Size,
+	}
+	// Include error message if stat failed (e.g., permission denied)
+	if resp.Error != "" {
+		response.Error = &resp.Error
+	}
+	return response, nil
+}
+
+// UpdateInstance updates mutable instance properties.
+// Note: Resolution is handled by ResolveResource middleware.
+func (s *ApiService) UpdateInstance(ctx context.Context, request oapi.UpdateInstanceRequestObject) (oapi.UpdateInstanceResponseObject, error) {
+	inst := mw.GetResolvedInstance[instances.Instance](ctx)
+	if inst == nil {
+		return oapi.UpdateInstance500JSONResponse{
+			Code:    "internal_error",
+			Message: "resource not resolved",
+		}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	if request.Body == nil {
+		return oapi.UpdateInstance400JSONResponse{
+			Code:    "invalid_request",
+			Message: "request body is required",
+		}, nil
+	}
+
+	env := make(map[string]string)
+	if request.Body.Env != nil {
+		env = *request.Body.Env
+	}
+	autoStandby, err := toDomainAutoStandbyPolicy(request.Body.AutoStandby)
+	if err != nil {
+		return oapi.UpdateInstance400JSONResponse{
+			Code:    "invalid_auto_standby",
+			Message: err.Error(),
+		}, nil
+	}
+	healthCheck, err := toDomainHealthCheck(request.Body.HealthCheck)
+	if err != nil {
+		return oapi.UpdateInstance400JSONResponse{
+			Code:    "invalid_health_check",
+			Message: err.Error(),
+		}, nil
+	}
+	restartPolicy, err := toDomainRestartPolicy(request.Body.RestartPolicy)
+	if err != nil {
+		return oapi.UpdateInstance400JSONResponse{
+			Code:    "invalid_restart_policy",
+			Message: err.Error(),
+		}, nil
+	}
+	if request.Body.Ttl != nil && request.Body.ExpiresAt != nil {
+		return oapi.UpdateInstance400JSONResponse{
+			Code:    "invalid_request",
+			Message: "ttl and expires_at are mutually exclusive",
+		}, nil
+	}
+	var ttl *time.Duration
+	if request.Body.Ttl != nil {
+		parsedTTL, err := parseTTL(*request.Body.Ttl)
+		if err != nil {
+			return oapi.UpdateInstance400JSONResponse{
+				Code:    "invalid_ttl",
+				Message: err.Error(),
+			}, nil
+		}
+		ttl = &parsedTTL
+	}
+
+	result, err := s.InstanceManager.UpdateInstance(ctx, inst.Id, instances.UpdateInstanceRequest{
+		Env:              env,
+		AutoStandby:      autoStandby,
+		HealthCheck:      healthCheck,
+		RestartPolicy:    restartPolicy,
+		RestartPolicySet: request.Body.RestartPolicy != nil,
+		TTL:              ttl,
+		ExpiresAt:        request.Body.ExpiresAt,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, instances.ErrNotFound):
+			return oapi.UpdateInstance404JSONResponse{
+				Code:    "not_found",
+				Message: "instance not found",
+			}, nil
+		case errors.Is(err, instances.ErrInvalidState):
+			return oapi.UpdateInstance409JSONResponse{
+				Code:    "invalid_state",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInstanceExpired):
+			return oapi.UpdateInstance409JSONResponse{
+				Code:    "instance_expired",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidExpiresAt):
+			return oapi.UpdateInstance400JSONResponse{
+				Code:    "invalid_expires_at",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, instances.ErrInvalidRequest):
+			return oapi.UpdateInstance400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to update instance", "error", err)
+			return oapi.UpdateInstance500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to update instance",
+			}, nil
+		}
+	}
+	return oapi.UpdateInstance200JSONResponse(instanceToOAPI(*result)), nil
+}
+
+// AttachVolume attaches a volume to an instance (not yet implemented)
+func (s *ApiService) AttachVolume(ctx context.Context, request oapi.AttachVolumeRequestObject) (oapi.AttachVolumeResponseObject, error) {
+	return oapi.AttachVolume500JSONResponse{
+		Code:    "not_implemented",
+		Message: "volume attachment not yet implemented",
+	}, nil
+}
+
+// DetachVolume detaches a volume from an instance (not yet implemented)
+func (s *ApiService) DetachVolume(ctx context.Context, request oapi.DetachVolumeRequestObject) (oapi.DetachVolumeResponseObject, error) {
+	return oapi.DetachVolume500JSONResponse{
+		Code:    "not_implemented",
+		Message: "volume detachment not yet implemented",
+	}, nil
+}
+
+// instanceToOAPI converts domain Instance to OAPI Instance
+func instanceToOAPI(inst instances.Instance) oapi.Instance {
+	// Format sizes as human-readable strings with best precision
+	// HR() returns format like "1.5 GB" with 1 decimal place
+	sizeStr := datasize.ByteSize(inst.Size).HR()
+	hotplugSizeStr := datasize.ByteSize(inst.HotplugSize).HR()
+	overlaySizeStr := datasize.ByteSize(inst.OverlaySize).HR()
+
+	// Format bandwidth as human-readable (bytes/s to rate string)
+	var downloadBwStr, uploadBwStr *string
+	if inst.NetworkBandwidthDownload > 0 {
+		s := datasize.ByteSize(inst.NetworkBandwidthDownload).HR() + "/s"
+		downloadBwStr = &s
+	}
+	if inst.NetworkBandwidthUpload > 0 {
+		s := datasize.ByteSize(inst.NetworkBandwidthUpload).HR() + "/s"
+		uploadBwStr = &s
+	}
+
+	// Build network payload as JSON to avoid compile-time coupling to
+	// generated anonymous struct tags in oapi.Instance.Network.
+	networkPayload := map[string]any{
+		"enabled": inst.NetworkEnabled,
+	}
+	if downloadBwStr != nil {
+		networkPayload["bandwidth_download"] = *downloadBwStr
+	}
+	if uploadBwStr != nil {
+		networkPayload["bandwidth_upload"] = *uploadBwStr
+	}
+	if inst.NetworkEnabled {
+		networkPayload["name"] = "default"
+		networkPayload["ip"] = inst.IP
+		networkPayload["mac"] = inst.MAC
+	}
+
+	// Convert hypervisor type
+	hvType := oapi.InstanceHypervisor(inst.HypervisorType)
+
+	// Format disk I/O as human-readable
+	var diskIoBpsStr *string
+	if inst.DiskIOBps > 0 {
+		s := datasize.ByteSize(inst.DiskIOBps).HR() + "/s"
+		diskIoBpsStr = &s
+	}
+
+	oapiInst := oapi.Instance{
+		Id:          inst.Id,
+		Name:        inst.Name,
+		Image:       inst.Image,
+		State:       oapi.InstanceState(inst.State),
+		StateError:  inst.StateError,
+		Size:        lo.ToPtr(sizeStr),
+		HotplugSize: lo.ToPtr(hotplugSizeStr),
+		OverlaySize: lo.ToPtr(overlaySizeStr),
+		Vcpus:       lo.ToPtr(inst.Vcpus),
+		DiskIoBps:   diskIoBpsStr,
+		Network:     nil,
+		CreatedAt:   inst.CreatedAt,
+		ExpiresAt:   inst.ExpiresAt,
+		StartedAt:   inst.StartedAt,
+		StoppedAt:   inst.StoppedAt,
+		ExitCode:    inst.ExitCode,
+		HasSnapshot: lo.ToPtr(inst.HasSnapshot),
+		Hypervisor:  &hvType,
+	}
+	if b, err := json.Marshal(networkPayload); err == nil {
+		_ = json.Unmarshal(b, &oapiInst.Network)
+	}
+
+	if inst.Platform != "" {
+		oapiInst.Platform = lo.ToPtr(inst.Platform)
+	}
+	if inst.ExitMessage != "" {
+		oapiInst.ExitMessage = lo.ToPtr(inst.ExitMessage)
+	}
+
+	if len(inst.Env) > 0 {
+		oapiInst.Env = &inst.Env
+	}
+
+	if len(inst.Tags) > 0 {
+		oapiInst.Tags = toOAPITags(inst.Tags)
+	}
+	if inst.SnapshotPolicy != nil {
+		oapiPolicy := toOAPISnapshotPolicy(*inst.SnapshotPolicy)
+		oapiInst.SnapshotPolicy = &oapiPolicy
+	}
+	oapiInst.AutoStandby = toOAPIAutoStandbyPolicy(inst.AutoStandby)
+	oapiInst.HealthCheck = toOAPIHealthCheck(inst.HealthCheck)
+	oapiInst.HealthStatus = toOAPIHealthStatus(healthcheck.Snapshot(inst.HealthCheck, string(inst.State), inst.HealthCheckRuntime))
+	oapiInst.RestartPolicy = toOAPIRestartPolicy(inst.RestartPolicy)
+	oapiInst.RestartStatus = toOAPIRestartStatus(inst.RestartStatus)
+
+	// Convert volume attachments
+	if len(inst.Volumes) > 0 {
+		oapiVolumes := make([]oapi.VolumeMount, len(inst.Volumes))
+		for i, vol := range inst.Volumes {
+			oapiVol := oapi.VolumeMount{
+				VolumeId:  vol.VolumeID,
+				MountPath: vol.MountPath,
+				Readonly:  lo.ToPtr(vol.Readonly),
+			}
+			if vol.Overlay {
+				oapiVol.Overlay = lo.ToPtr(true)
+				overlaySizeStr := datasize.ByteSize(vol.OverlaySize).HR()
+				oapiVol.OverlaySize = lo.ToPtr(overlaySizeStr)
+			}
+			oapiVolumes[i] = oapiVol
+		}
+		oapiInst.Volumes = &oapiVolumes
+	}
+
+	// Convert GPU info
+	if inst.GPUProfile != "" {
+		gpu := &oapi.InstanceGPU{
+			Profile: lo.ToPtr(inst.GPUProfile),
+		}
+		// Only set MdevUuid when non-empty to avoid "mdev_uuid": "" in output
+		if inst.GPUMdevUUID != "" {
+			gpu.MdevUuid = lo.ToPtr(inst.GPUMdevUUID)
+		}
+		if inst.GPUDevicePath != "" {
+			gpu.DevicePath = lo.ToPtr(inst.GPUDevicePath)
+		}
+		oapiInst.Gpu = gpu
+	}
+
+	// Expose phase accounting (cumulative time in each lifecycle phase). The
+	// snapshot rolls in time accrued in the current phase since the last
+	// transition, so consumers don't need a separate "live since" calculation.
+	if inst.Phases.Current != "" {
+		current := string(inst.Phases.Current)
+		oapiInst.CurrentPhase = &current
+		since := inst.Phases.Since
+		oapiInst.CurrentPhaseSince = &since
+		snapshot := inst.Phases.Snapshot(time.Now())
+		out := make(map[string]int64, len(snapshot))
+		for k, v := range snapshot {
+			out[string(k)] = v
+		}
+		oapiInst.PhaseDurationsMs = &out
+	}
+
+	return oapiInst
+}
+
+func toDomainSnapshotCompressionConfig(cfg oapi.SnapshotCompressionConfig) (*snapshot.SnapshotCompressionConfig, error) {
+	out := &snapshot.SnapshotCompressionConfig{
+		Enabled: cfg.Enabled,
+	}
+	if cfg.Algorithm != nil {
+		algo := snapshot.SnapshotCompressionAlgorithm(strings.ToLower(string(*cfg.Algorithm)))
+		switch algo {
+		case snapshot.SnapshotCompressionAlgorithmZstd, snapshot.SnapshotCompressionAlgorithmLz4:
+		default:
+			return nil, fmt.Errorf("algorithm must be one of zstd or lz4, got %q", *cfg.Algorithm)
+		}
+		out.Algorithm = algo
+	}
+	if cfg.Level != nil {
+		level := *cfg.Level
+		algo := out.Algorithm
+		if algo == "" {
+			algo = snapshot.SnapshotCompressionAlgorithmZstd
+		}
+		switch algo {
+		case snapshot.SnapshotCompressionAlgorithmZstd:
+			if level < snapshot.MinSnapshotCompressionZstdLevel || level > snapshot.MaxSnapshotCompressionZstdLevel {
+				return nil, fmt.Errorf("level must be between %d and %d for zstd, got %d", snapshot.MinSnapshotCompressionZstdLevel, snapshot.MaxSnapshotCompressionZstdLevel, level)
+			}
+		case snapshot.SnapshotCompressionAlgorithmLz4:
+			if level < snapshot.MinSnapshotCompressionLz4Level || level > snapshot.MaxSnapshotCompressionLz4Level {
+				return nil, fmt.Errorf("level must be between %d and %d for lz4, got %d", snapshot.MinSnapshotCompressionLz4Level, snapshot.MaxSnapshotCompressionLz4Level, level)
+			}
+		}
+		out.Level = &level
+	}
+	return out, nil
+}
+
+func toInstanceSnapshotPolicy(policy oapi.SnapshotPolicy) (*instances.SnapshotPolicy, error) {
+	out := &instances.SnapshotPolicy{}
+	if policy.Compression != nil {
+		compression, err := toDomainSnapshotCompressionConfig(*policy.Compression)
+		if err != nil {
+			return nil, err
+		}
+		out.Compression = compression
+	}
+	if policy.StandbyCompressionDelay != nil {
+		delay, err := parseOptionalDuration(*policy.StandbyCompressionDelay, "standby_compression_delay")
+		if err != nil {
+			return nil, err
+		}
+		out.StandbyCompressionDelay = delay
+	}
+	return out, nil
+}
+
+func toOAPISnapshotCompressionConfig(cfg snapshot.SnapshotCompressionConfig) oapi.SnapshotCompressionConfig {
+	out := oapi.SnapshotCompressionConfig{
+		Enabled: cfg.Enabled,
+	}
+	if cfg.Algorithm != "" {
+		algo := oapi.SnapshotCompressionConfigAlgorithm(cfg.Algorithm)
+		out.Algorithm = &algo
+	}
+	if cfg.Level != nil {
+		level := *cfg.Level
+		out.Level = &level
+	}
+	return out
+}
+
+func toOAPISnapshotPolicy(policy instances.SnapshotPolicy) oapi.SnapshotPolicy {
+	out := oapi.SnapshotPolicy{}
+	if policy.Compression != nil {
+		compression := toOAPISnapshotCompressionConfig(*policy.Compression)
+		out.Compression = &compression
+	}
+	if policy.StandbyCompressionDelay != nil {
+		delay := policy.StandbyCompressionDelay.String()
+		out.StandbyCompressionDelay = &delay
+	}
+	return out
+}
+
+func parseTTL(value string) (time.Duration, error) {
+	ttl, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("ttl must be a valid duration: %w", err)
+	}
+	if ttl < 0 {
+		return 0, fmt.Errorf("ttl cannot be negative")
+	}
+	return ttl, nil
+}
+
+func parseOptionalDuration(value string, field string) (*time.Duration, error) {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be a valid duration: %w", field, err)
+	}
+	if duration < 0 {
+		return nil, fmt.Errorf("%s cannot be negative", field)
+	}
+	return &duration, nil
+}

@@ -1,0 +1,199 @@
+# System Manager
+
+Manages versioned kernel and initrd files for Cloud Hypervisor VMs.
+
+## Features
+
+- **Automatic Downloads**: Kernel downloaded from kernel/linux releases on first use
+- **Automatic Build**: Initrd built from Alpine base + Go init binary + guest-agent
+- **Versioned**: Side-by-side support for multiple kernel versions
+- **Zero Docker**: Uses OCI directly (reuses image manager infrastructure)
+- **Zero Image Modifications**: All init logic in initrd, OCI images used as-is
+- **Dual Mode Support**: Exec mode (container-like) and systemd mode (full VM)
+
+## Architecture
+
+### Storage Layout
+
+```
+{dataDir}/system/
+├── kernel/
+│   ├── ch-6.12.8-kernel-1-202511182/
+│   │   ├── x86_64/vmlinux   (~70MB)
+│   │   └── aarch64/Image    (~70MB)
+│   └── ch-6.12.8-kernel-1.2-20251213/
+│       └── ... (newer version)
+├── initrd/
+│   ├── 1734567890/              (timestamp-based)
+│   │   ├── x86_64/initrd        (~5-10MB)
+│   │   └── aarch64/initrd
+│   ├── x86_64/latest -> 1734567890  (symlink to latest)
+│   └── aarch64/latest -> 1734567890
+└── oci-cache/                   (shared with images manager)
+    └── blobs/sha256/            (Alpine layers cached)
+```
+
+### Versioning Rules
+
+**Snapshots require exact matches:**
+```
+Standby:  kernel ch-6.12.8-kernel-1.2-20251213, CH v51.1
+Restore:  kernel ch-6.12.8-kernel-1.2-20251213, CH v51.1 (MUST match)
+```
+
+**Maintenance upgrades (shutdown → boot):**
+```
+1. Update DefaultKernelVersion in versions.go
+2. Shutdown instance
+3. Boot instance (uses new kernel/initrd)
+```
+
+**Multi-version support:**
+```
+Instance A (standby): kernel ch-6.12.8-kernel-1-202511182
+Instance B (running): kernel ch-6.12.8-kernel-1.2-20251213
+Both work independently
+```
+
+## Go Init Binary
+
+The init binary (`lib/system/init/`) is a Go program that runs as PID 1 in the guest VM.
+It replaces the previous shell-based init script with cleaner logic and structured logging.
+
+**Initrd handles:**
+- ✅ Mount overlay filesystem
+- ✅ Mount and source config disk
+- ✅ Network configuration (if enabled)
+- ✅ Load GPU drivers (if GPU attached)
+- ✅ Mount volumes
+- ✅ Execute container entrypoint (exec mode)
+- ✅ Hand off to systemd via root switch + exec (systemd mode)
+
+**Two boot modes:**
+- **Exec mode** (default): Init switches root to the container rootfs, starts guest-agent, and waits on an event-driven readiness signal (pipe FD, 10s timeout) before launching the entrypoint. When the app exits, init logs exit info and cleanly shuts down the VM via `reboot(POWER_OFF)`.
+- **Systemd mode** (auto-detected on host): Init injects systemd units (guest-agent plus async kernel-headers worker), emits handoff marker, then execs /sbin/init so systemd becomes PID 1.
+
+**Root switch:** Both modes move the overlay rootfs onto `/` (`MS_MOVE`, as `switch_root(8)` does) and then chroot into it, so the image rootfs is the mount namespace root rather than the initrd. A plain chroot left the initrd as the namespace root, which broke `setns(2)`-based tools inside the guest such as `docker exec` into a nested container. `pivot_root(2)` is not usable while `/` is the initramfs.
+
+**Boot progress sentinels:** Init and guest-agent emit machine-parseable markers to serial console:
+- `HYPEMAN-PROGRAM-START ts=... mode=...`
+- `HYPEMAN-AGENT-READY ts=...`
+- `HYPEMAN-HEADERS-START ts=...`
+- `HYPEMAN-HEADERS-READY ts=...`
+- `HYPEMAN-HEADERS-FAILED ts=... error="..."`
+
+Host state derivation uses these sentinels to report `Initializing` until both required markers are present (or until `skip_guest_agent=true` bypasses the agent marker requirement).
+
+**Graceful shutdown:** The host sends a `Shutdown` gRPC RPC to the guest-agent, which signals PID 1 (init). Init forwards the signal to the entrypoint child process. If the app doesn't exit within the stop timeout, the host falls back to hypervisor shutdown and then force-kills the hypervisor process if still needed.
+
+**Exit info propagation:** When the entrypoint exits, init writes a machine-parseable `HYPEMAN-EXIT` sentinel to the serial console with the exit code and a human-readable description (signal names, OOM detection via `/dev/kmsg`, shell conventions for 126/127). The host lazily parses this from the serial log when it discovers the VM has stopped, and persists `exit_code`/`exit_message` to instance metadata and the API.
+
+**Environment variables:** In exec mode, env vars are passed directly to the entrypoint and guest-agent processes. In systemd mode, env vars are written to `/etc/hypeman/env` and loaded via `EnvironmentFile` in the `hypeman-agent.service` unit.
+
+**Systemd detection:** Host-side detection in `lib/images/systemd.go` checks if image CMD is
+`/sbin/init`, `/lib/systemd/systemd`, or similar. The detected mode is passed to the initrd
+via `INIT_MODE` in the config disk.
+
+**Result:** OCI images require **zero modifications** - no `/init` script needed!
+
+## Kernel Headers
+
+Kernel headers are bundled in the initrd and installed asynchronously after boot handoff, enabling DKMS to build out-of-tree kernel modules (e.g., NVIDIA vGPU drivers) without delaying `Running`.
+
+**Why:** Guest images come with headers for their native kernel (e.g., Ubuntu's 5.15), but hypeman VMs run a custom kernel. Without matching headers, DKMS cannot compile drivers.
+
+**How:** The initrd includes `kernel-headers.tar.gz` from the same release as the kernel. A background worker (exec mode) or injected systemd oneshot unit (systemd mode) performs installation:
+- writes `/run/hypeman/kernel-headers.status` as `pending|running|ready|failed`
+- fast-path skips extraction when matching headers + build symlink are already valid
+- otherwise extracts headers to `/usr/src/linux-headers-{version}/`, creates `/lib/modules/{version}/build`, and removes mismatched headers from the guest image
+
+**Result:** Guests can `apt install nvidia-driver-xxx` and DKMS builds modules for the running kernel automatically once headers status reaches `ready`.
+
+## Kernel Sources
+
+Kernels downloaded from kernel/linux releases (Cloud Hypervisor-optimized fork):
+- https://github.com/kernel/linux/releases
+
+Example URLs:
+- x86_64: `https://github.com/kernel/linux/releases/download/ch-6.12.8-kernel-1.2-20251213/vmlinux-x86_64`
+- aarch64: `https://github.com/kernel/linux/releases/download/ch-6.12.8-kernel-1.2-20251213/Image-arm64`
+
+## Initrd Build Process
+
+1. **Pull Alpine base** (using image manager's OCI client)
+2. **Add guest-agent binary** (embedded, runs in guest for exec/shell)
+3. **Add init.sh wrapper** (mounts /proc, /sys, /dev before Go runtime)
+4. **Add init binary** (embedded Go binary, runs as PID 1)
+5. **Add kernel headers tarball** (downloaded from release, for DKMS)
+6. **Package as cpio** (initramfs format, pure Go - no shell tools required)
+
+## Adding New Versions
+
+### New Kernel Version
+
+```go
+// lib/system/versions.go
+
+const (
+    Kernel_20251220 KernelVersion = "ch-6.12.8-kernel-1.3-20251220"  // Add constant
+)
+
+var KernelDownloadURLs = map[KernelVersion]map[string]string{
+    // ... existing ...
+    Kernel_20251220: {
+        "x86_64":  "https://github.com/kernel/linux/releases/download/ch-6.12.8-kernel-1.3-20251220/vmlinux-x86_64",
+        "aarch64": "https://github.com/kernel/linux/releases/download/ch-6.12.8-kernel-1.3-20251220/Image-arm64",
+    },
+}
+
+// Update default if needed
+var DefaultKernelVersion = Kernel_20251220
+```
+
+### Updating the Init Binary
+
+The init binary is in `lib/system/init/`. After making changes:
+
+1. Build the init binary (statically linked for Alpine):
+   ```bash
+   make build-init
+   ```
+
+2. The binary is embedded via `lib/system/init_binary.go`
+
+3. The initrd hash includes the binary, so it will auto-rebuild on next startup
+
+## Testing
+
+```bash
+# Unit tests (no downloads)
+go test -short ./lib/system/...
+
+# Integration tests (downloads kernel, builds initrd)
+go test ./lib/system/...
+```
+
+## Files Generated
+
+| File | Size | Purpose |
+|------|------|---------|
+| kernel/*/vmlinux | ~70MB | Cloud Hypervisor optimized kernel |
+| initrd/*/initrd | ~20MB | Alpine base + init binary + guest-agent + kernel headers |
+
+Files downloaded/built once per version, reused for all instances using that version.
+
+## Init Binary Package Structure
+
+```
+lib/system/init/
+    main.go           # Entry point, orchestrates staged boot
+    init.sh           # Shell wrapper (mounts /proc, /sys, /dev before Go runtime)
+    mount.go          # Mount operations (overlay, bind mounts)
+    config.go         # Parse config disk
+    network.go        # Network configuration
+    headers.go        # Kernel headers setup for DKMS
+    volumes.go        # Volume mounting
+    mode_exec.go      # Exec mode: root switch, event-driven agent gate, run entrypoint
+    mode_systemd.go   # Systemd mode: inject units + root switch + handoff marker + exec /sbin/init
+    logger.go         # Human-readable logging to hypeman operations log
+```

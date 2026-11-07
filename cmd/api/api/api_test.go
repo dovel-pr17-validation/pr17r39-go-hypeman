@@ -1,0 +1,224 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/kernel/hypeman/cmd/api/config"
+	"github.com/kernel/hypeman/lib/builders"
+	"github.com/kernel/hypeman/lib/builds"
+	"github.com/kernel/hypeman/lib/devices"
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/instances"
+	mw "github.com/kernel/hypeman/lib/middleware"
+	"github.com/kernel/hypeman/lib/network"
+	"github.com/kernel/hypeman/lib/oapi"
+	"github.com/kernel/hypeman/lib/paths"
+	"github.com/kernel/hypeman/lib/resources"
+	"github.com/kernel/hypeman/lib/system"
+	"github.com/kernel/hypeman/lib/volumes"
+	"github.com/stretchr/testify/require"
+)
+
+// newTestService creates an ApiService for testing with automatic cleanup
+func newTestService(t *testing.T) *ApiService {
+	dataDir := t.TempDir()
+	prepareAPITestDataDir(t, dataDir)
+	cfg := &config.Config{
+		DataDir: dataDir,
+		Network: newParallelTestNetworkConfig(t),
+	}
+
+	p := paths.New(cfg.DataDir)
+	imageMgr, err := images.NewManager(p, 1, nil)
+	if err != nil {
+		t.Fatalf("failed to create image manager: %v", err)
+	}
+
+	systemMgr := system.NewManager(p)
+	networkMgr := network.NewManager(p, cfg, nil)
+	deviceMgr := devices.NewManager(p)
+	volumeMgr := volumes.NewManager(p, 0, nil) // 0 = unlimited storage
+	resourceMgr := resources.NewManager(cfg, p)
+	limits := instances.ResourceLimits{
+		MaxOverlaySize: 100 * 1024 * 1024 * 1024, // 100GB
+	}
+	instanceMgr := instances.NewManager(p, imageMgr, systemMgr, networkMgr, deviceMgr, volumeMgr, limits, "", instances.SnapshotPolicy{}, nil, nil)
+	builderMgr, err := builders.NewManager(p, builders.Config{}, volumeMgr, instanceMgr, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create builders manager: %v", err)
+	}
+	buildMgr, err := builds.NewManager(p, builds.Config{
+		MaxConcurrentBuilds: 2,
+		RegistryURL:         "localhost:5000",
+		DefaultTimeout:      300,
+	}, instanceMgr, volumeMgr, builderMgr, imageMgr, &builds.NoOpSecretProvider{}, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create build manager: %v", err)
+	}
+	builderMgr.SetBuildActivityChecker(buildMgr.BuilderHasBuilds)
+
+	// Initialize network manager (creates bridge for network-enabled tests)
+	if err := networkMgr.Initialize(ctx(), nil); err != nil {
+		t.Logf("Warning: failed to initialize network manager: %v (network tests may fail)", err)
+	}
+
+	// Register cleanup for orphaned Cloud Hypervisor processes
+	t.Cleanup(func() {
+		cleanupOrphanedProcesses(t, cfg.DataDir)
+	})
+
+	return &ApiService{
+		Config:          cfg,
+		ImageManager:    imageMgr,
+		InstanceManager: instanceMgr,
+		VolumeManager:   volumeMgr,
+		BuilderManager:  builderMgr,
+		BuildManager:    buildMgr,
+		NetworkManager:  networkMgr,
+		DeviceManager:   deviceMgr,
+		ResourceManager: resourceMgr,
+	}
+}
+
+// cleanupOrphanedProcesses kills hypervisor processes from metadata files
+func cleanupOrphanedProcesses(t *testing.T, dataDir string) {
+	p := paths.New(dataDir)
+	guestsDir := p.GuestsDir()
+
+	entries, err := os.ReadDir(guestsDir)
+	if err != nil {
+		return // No guests directory
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		metaPath := p.InstanceMetadata(entry.Name())
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+
+		// Parse just the HypervisorPID field
+		var meta struct {
+			HypervisorPID *int `json:"HypervisorPID"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+
+		// If metadata has a PID, try to kill it
+		if meta.HypervisorPID != nil {
+			pid := *meta.HypervisorPID
+
+			// Check if process exists
+			if err := syscall.Kill(pid, 0); err == nil {
+				t.Logf("Cleaning up orphaned hypervisor process: PID %d", pid)
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	}
+}
+
+func ctx() context.Context {
+	return context.Background()
+}
+
+func integrationTestTimeout(timeout time.Duration) time.Duration {
+	if os.Getenv("CI") == "true" && timeout < 45*time.Second {
+		return 45 * time.Second
+	}
+	return timeout
+}
+
+// ctxWithInstance creates a context with a resolved instance (simulates ResolveResource middleware)
+func ctxWithInstance(svc *ApiService, idOrName string) context.Context {
+	inst, err := svc.InstanceManager.GetInstance(ctx(), idOrName)
+	if err != nil {
+		return ctx() // Let handler deal with the error
+	}
+	return mw.WithResolvedInstance(ctx(), inst.Id, inst)
+}
+
+// ctxWithBuilder creates a context with a resolved builder (simulates ResolveResource middleware)
+func ctxWithBuilder(svc *ApiService, id string) context.Context {
+	b, err := svc.BuilderManager.GetBuilder(ctx(), id)
+	if err != nil {
+		return ctx()
+	}
+	return mw.WithResolvedBuilder(ctx(), b.ID, b)
+}
+
+// ctxWithVolume creates a context with a resolved volume (simulates ResolveResource middleware)
+func ctxWithVolume(svc *ApiService, idOrName string) context.Context {
+	vol, err := svc.VolumeManager.GetVolume(ctx(), idOrName)
+	if err != nil {
+		vol, err = svc.VolumeManager.GetVolumeByName(ctx(), idOrName)
+	}
+	if err != nil {
+		return ctx()
+	}
+	return mw.WithResolvedVolume(ctx(), vol.Id, vol)
+}
+
+// ctxWithImage creates a context with a resolved image (simulates ResolveResource middleware)
+func ctxWithImage(svc *ApiService, name string) context.Context {
+	img, err := svc.ImageManager.GetImage(ctx(), name)
+	if err != nil {
+		return ctx()
+	}
+	return mw.WithResolvedImage(ctx(), img.Name, img)
+}
+
+// createAndWaitForImage creates an image and waits for it to be ready.
+// Returns the image name on success, or fails the test on error/timeout.
+func createAndWaitForImage(t *testing.T, svc *ApiService, imageName string, timeout time.Duration) string {
+	t.Helper()
+	imageName = apiTestImageRef(t, imageName)
+
+	t.Logf("Creating image %s...", imageName)
+	imgResp, err := svc.CreateImage(ctx(), oapi.CreateImageRequestObject{
+		Body: &oapi.CreateImageRequest{
+			Name: imageName,
+		},
+	})
+	require.NoError(t, err)
+
+	imgCreated, ok := imgResp.(oapi.CreateImage202JSONResponse)
+	require.True(t, ok, "expected 202 response for image creation")
+
+	t.Log("Waiting for image to be ready...")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		// Get image from manager (may fail during pending/pulling, that's OK)
+		img, err := svc.ImageManager.GetImage(ctx(), imageName)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		switch img.Status {
+		case "ready":
+			t.Log("Image is ready")
+			return imgCreated.Name
+		case "failed":
+			errMsg := ""
+			if img.Error != nil {
+				errMsg = *img.Error
+			}
+			t.Fatalf("Image build failed: %v", errMsg)
+		}
+		// Still pending/pulling/converting, poll again
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("Timeout waiting for image %s to be ready", imageName)
+	return ""
+}

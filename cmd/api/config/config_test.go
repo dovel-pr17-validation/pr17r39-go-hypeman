@@ -1,0 +1,607 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/c2h5oh/datasize"
+	"github.com/kernel/hypeman/lib/guestmemory"
+)
+
+func TestDefaultConfigUsesHypemanPort(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.Port != "4973" {
+		t.Fatalf("expected default port to be 4973, got %q", cfg.Port)
+	}
+	if cfg.Registry.URL != "localhost:4973" {
+		t.Fatalf("expected default registry URL to use port 4973, got %q", cfg.Registry.URL)
+	}
+}
+
+func TestDefaultConfigIncludesMetricsSettings(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.Metrics.ListenAddress != "127.0.0.1" {
+		t.Fatalf("expected default metrics.listen_address to be 127.0.0.1, got %q", cfg.Metrics.ListenAddress)
+	}
+	if cfg.Metrics.Port != 9464 {
+		t.Fatalf("expected default metrics.port to be 9464, got %d", cfg.Metrics.Port)
+	}
+	if cfg.Metrics.VMLabelBudget != 200 {
+		t.Fatalf("expected default metrics.vm_label_budget to be 200, got %d", cfg.Metrics.VMLabelBudget)
+	}
+	if cfg.Metrics.ResourceRefreshInterval != "120s" {
+		t.Fatalf("expected default metrics.resource_refresh_interval to be 120s, got %q", cfg.Metrics.ResourceRefreshInterval)
+	}
+	if cfg.Metrics.AllocationReconcileInterval != "120s" {
+		t.Fatalf("expected default metrics.allocation_reconcile_interval to be 120s, got %q", cfg.Metrics.AllocationReconcileInterval)
+	}
+	if cfg.Otel.MetricExportInterval != "60s" {
+		t.Fatalf("expected default otel.metric_export_interval to be 60s, got %q", cfg.Otel.MetricExportInterval)
+	}
+	if cfg.Otel.SuccessfulGetSampleRatio != 0.1 {
+		t.Fatalf("expected default otel.successful_get_sample_ratio to be 0.1, got %v", cfg.Otel.SuccessfulGetSampleRatio)
+	}
+	if cfg.Images.AutoDelete.Enabled {
+		t.Fatalf("expected default images.auto_delete.enabled to be false")
+	}
+	if cfg.Images.AutoDelete.UnusedFor != "720h" {
+		t.Fatalf("expected default images.auto_delete.unused_for to be 720h, got %q", cfg.Images.AutoDelete.UnusedFor)
+	}
+	if len(cfg.Images.AutoDelete.Allowed) != 0 {
+		t.Fatalf("expected default images.auto_delete.allowed to be empty, got %v", cfg.Images.AutoDelete.Allowed)
+	}
+	if cfg.Images.OCICacheGC.Enabled {
+		t.Fatalf("expected default images.oci_cache_gc.enabled to be false")
+	}
+	if cfg.Images.OCICacheGC.Interval != "1h" {
+		t.Fatalf("expected default images.oci_cache_gc.interval to be 1h, got %q", cfg.Images.OCICacheGC.Interval)
+	}
+	if cfg.Images.OCICacheGC.MinBlobAge != "1h" {
+		t.Fatalf("expected default images.oci_cache_gc.min_blob_age to be 1h, got %q", cfg.Images.OCICacheGC.MinBlobAge)
+	}
+	if cfg.Instances.LifecycleEventBufferSize != 256 {
+		t.Fatalf("expected default instances.lifecycle_event_buffer_size to be 256, got %d", cfg.Instances.LifecycleEventBufferSize)
+	}
+	if cfg.Hypervisor.FirecrackerSnapshotMemoryBackend != "file" {
+		t.Fatalf("expected default firecracker snapshot backend to be file, got %q", cfg.Hypervisor.FirecrackerSnapshotMemoryBackend)
+	}
+	if cfg.Hypervisor.FirecrackerUFFDCacheMaxBytes != "4294967296" {
+		t.Fatalf("expected default firecracker uffd cache size to be 4294967296, got %q", cfg.Hypervisor.FirecrackerUFFDCacheMaxBytes)
+	}
+	if cfg.Hypervisor.FirecrackerMaxConcurrentRestores != 32 {
+		t.Fatalf("expected default firecracker max concurrent restores to be 32, got %d", cfg.Hypervisor.FirecrackerMaxConcurrentRestores)
+	}
+}
+
+func TestValidateFirecrackerSnapshotMemoryBackend(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Hypervisor.FirecrackerSnapshotMemoryBackend = "UFFD"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected UFFD backend to validate, got %v", err)
+	}
+	if cfg.Hypervisor.FirecrackerSnapshotMemoryBackend != "uffd" {
+		t.Fatalf("expected backend to normalize to uffd, got %q", cfg.Hypervisor.FirecrackerSnapshotMemoryBackend)
+	}
+
+	cfg = defaultConfig()
+	cfg.Hypervisor.FirecrackerSnapshotMemoryBackend = "bad"
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected invalid firecracker snapshot backend validation error")
+	}
+
+	cfg = defaultConfig()
+	cfg.Hypervisor.FirecrackerUFFDCacheMaxBytes = "not-a-size"
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected invalid firecracker uffd cache size validation error")
+	}
+}
+
+func TestValidateFirecrackerMaxConcurrentRestores(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Hypervisor.FirecrackerMaxConcurrentRestores = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected invalid firecracker max concurrent restores validation error")
+	}
+}
+
+func TestLoadEnvOverridesMetricsAndOtelInterval(t *testing.T) {
+	t.Setenv("METRICS__LISTEN_ADDRESS", "0.0.0.0")
+	t.Setenv("METRICS__PORT", "9999")
+	t.Setenv("METRICS__VM_LABEL_BUDGET", "350")
+	t.Setenv("METRICS__RESOURCE_REFRESH_INTERVAL", "30s")
+	t.Setenv("METRICS__ALLOCATION_RECONCILE_INTERVAL", "45s")
+	t.Setenv("OTEL__METRIC_EXPORT_INTERVAL", "15s")
+	t.Setenv("OTEL__SUCCESSFUL_GET_SAMPLE_RATIO", "0.25")
+	t.Setenv("INSTANCES__LIFECYCLE_EVENT_BUFFER_SIZE", "512")
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.Metrics.ListenAddress != "0.0.0.0" {
+		t.Fatalf("expected metrics.listen_address override, got %q", cfg.Metrics.ListenAddress)
+	}
+	if cfg.Metrics.Port != 9999 {
+		t.Fatalf("expected metrics.port override, got %d", cfg.Metrics.Port)
+	}
+	if cfg.Metrics.VMLabelBudget != 350 {
+		t.Fatalf("expected metrics.vm_label_budget override, got %d", cfg.Metrics.VMLabelBudget)
+	}
+	if cfg.Metrics.ResourceRefreshInterval != "30s" {
+		t.Fatalf("expected metrics.resource_refresh_interval override, got %q", cfg.Metrics.ResourceRefreshInterval)
+	}
+	if cfg.Metrics.AllocationReconcileInterval != "45s" {
+		t.Fatalf("expected metrics.allocation_reconcile_interval override, got %q", cfg.Metrics.AllocationReconcileInterval)
+	}
+	if cfg.Otel.MetricExportInterval != "15s" {
+		t.Fatalf("expected otel.metric_export_interval override, got %q", cfg.Otel.MetricExportInterval)
+	}
+	if cfg.Otel.SuccessfulGetSampleRatio != 0.25 {
+		t.Fatalf("expected otel.successful_get_sample_ratio override, got %v", cfg.Otel.SuccessfulGetSampleRatio)
+	}
+	if cfg.Instances.LifecycleEventBufferSize != 512 {
+		t.Fatalf("expected instances.lifecycle_event_buffer_size override, got %d", cfg.Instances.LifecycleEventBufferSize)
+	}
+}
+
+func TestLoadExpandsHomePathsFromConfigFile(t *testing.T) {
+	clearPathEnvOverrides(t)
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`
+data_dir: ~/Library/Application Support/hypeman
+build:
+  secrets_dir: ~/.config/hypeman/secrets
+  docker_socket: ~/.colima/default/docker.sock
+registry:
+  ca_cert_file: ~/.config/hypeman/ca.pem
+hypervisor:
+  firecracker_binary_path: ~/bin/firecracker
+`), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("get home dir: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	assertPath := func(name, got, wantSuffix string) {
+		t.Helper()
+		want := filepath.Join(home, wantSuffix)
+		if got != want {
+			t.Fatalf("expected %s to expand to %q, got %q", name, want, got)
+		}
+	}
+
+	assertPath("data_dir", cfg.DataDir, filepath.Join("Library", "Application Support", "hypeman"))
+	assertPath("build.secrets_dir", cfg.Build.SecretsDir, filepath.Join(".config", "hypeman", "secrets"))
+	assertPath("build.docker_socket", cfg.Build.DockerSocket, filepath.Join(".colima", "default", "docker.sock"))
+	assertPath("registry.ca_cert_file", cfg.Registry.CACertFile, filepath.Join(".config", "hypeman", "ca.pem"))
+	assertPath("hypervisor.firecracker_binary_path", cfg.Hypervisor.FirecrackerBinaryPath, filepath.Join("bin", "firecracker"))
+}
+
+func clearPathEnvOverrides(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"DATA_DIR",
+		"BUILD__SECRETS_DIR",
+		"BUILD__DOCKER_SOCKET",
+		"REGISTRY__CA_CERT_FILE",
+		"HYPERVISOR__FIRECRACKER_BINARY_PATH",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestLoadExpandsHomePathsFromEnv(t *testing.T) {
+	t.Setenv("DATA_DIR", "~/hypeman-data")
+	t.Setenv("BUILD__DOCKER_SOCKET", "~/.colima/default/docker.sock")
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("get home dir: %v", err)
+	}
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if want := filepath.Join(home, "hypeman-data"); cfg.DataDir != want {
+		t.Fatalf("expected env data_dir to expand to %q, got %q", want, cfg.DataDir)
+	}
+	if want := filepath.Join(home, ".colima", "default", "docker.sock"); cfg.Build.DockerSocket != want {
+		t.Fatalf("expected env build.docker_socket to expand to %q, got %q", want, cfg.Build.DockerSocket)
+	}
+}
+
+func TestValidateRejectsInvalidMetricsPort(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Metrics.Port = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid metrics port")
+	}
+}
+
+func TestValidateRejectsInvalidVFQuarantineThreshold(t *testing.T) {
+	for _, threshold := range []int{0, -1} {
+		cfg := defaultConfig()
+		cfg.GPU.VFQuarantineThreshold = threshold
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatalf("expected validation error for vf_quarantine_threshold %d", threshold)
+		}
+	}
+}
+
+func TestValidateRejectsInvalidMetricExportInterval(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Otel.MetricExportInterval = "not-a-duration"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid metric export interval")
+	}
+}
+
+func TestValidateRejectsInvalidSuccessfulGetSampleRatio(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Otel.SuccessfulGetSampleRatio = 1.1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid successful get sample ratio")
+	}
+}
+
+func TestValidateRejectsInvalidVMLabelBudget(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Metrics.VMLabelBudget = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid vm label budget")
+	}
+}
+
+func TestValidateRejectsInvalidResourceRefreshInterval(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Metrics.ResourceRefreshInterval = ""
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for empty resource refresh interval")
+	}
+
+	cfg = defaultConfig()
+	cfg.Metrics.ResourceRefreshInterval = "not-a-duration"
+
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid resource refresh interval")
+	}
+
+	cfg = defaultConfig()
+	cfg.Metrics.ResourceRefreshInterval = "0s"
+
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for non-positive resource refresh interval")
+	}
+}
+
+func TestValidateRejectsInvalidAllocationReconcileInterval(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Metrics.AllocationReconcileInterval = ""
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for empty allocation reconcile interval")
+	}
+
+	cfg = defaultConfig()
+	cfg.Metrics.AllocationReconcileInterval = "not-a-duration"
+
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid allocation reconcile interval")
+	}
+
+	cfg = defaultConfig()
+	cfg.Metrics.AllocationReconcileInterval = "0s"
+
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for non-positive allocation reconcile interval")
+	}
+}
+
+func TestLoadUsesConfiguredLifecycleEventBufferSize(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("instances:\n  lifecycle_event_buffer_size: 384\n"), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.Instances.LifecycleEventBufferSize != 384 {
+		t.Fatalf("expected instances.lifecycle_event_buffer_size from config file, got %d", cfg.Instances.LifecycleEventBufferSize)
+	}
+}
+
+func TestValidateRejectsInvalidLifecycleEventBufferSize(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Instances.LifecycleEventBufferSize = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid lifecycle event buffer size")
+	}
+}
+
+func TestLoadUsesDefaultImageAutoDeleteRetentionWindow(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("images:\n  auto_delete:\n    enabled: true\n"), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if !cfg.Images.AutoDelete.Enabled {
+		t.Fatalf("expected images.auto_delete.enabled override to be true")
+	}
+	if cfg.Images.AutoDelete.UnusedFor != "720h" {
+		t.Fatalf("expected default images.auto_delete.unused_for to remain 720h, got %q", cfg.Images.AutoDelete.UnusedFor)
+	}
+	if len(cfg.Images.AutoDelete.Allowed) != 0 {
+		t.Fatalf("expected default images.auto_delete.allowed to remain empty, got %v", cfg.Images.AutoDelete.Allowed)
+	}
+}
+
+func TestValidateRejectsInvalidImageAutoDeleteUnusedFor(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Images.AutoDelete.UnusedFor = "not-a-duration"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid images.auto_delete.unused_for")
+	}
+}
+
+func TestLoadUsesDefaultOCICacheGCSettingsWhenEnabledOnly(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("images:\n  oci_cache_gc:\n    enabled: true\n"), 0600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if !cfg.Images.OCICacheGC.Enabled {
+		t.Fatalf("expected images.oci_cache_gc.enabled override to be true")
+	}
+	if cfg.Images.OCICacheGC.Interval != "1h" {
+		t.Fatalf("expected default images.oci_cache_gc.interval to remain 1h, got %q", cfg.Images.OCICacheGC.Interval)
+	}
+	if cfg.Images.OCICacheGC.MinBlobAge != "1h" {
+		t.Fatalf("expected default images.oci_cache_gc.min_blob_age to remain 1h, got %q", cfg.Images.OCICacheGC.MinBlobAge)
+	}
+}
+
+func TestValidateRejectsInvalidOCICacheGCInterval(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Images.OCICacheGC.Interval = "not-a-duration"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid images.oci_cache_gc.interval")
+	}
+
+	cfg = defaultConfig()
+	cfg.Images.OCICacheGC.Interval = "0s"
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Fatalf("expected positive validation error for zero images.oci_cache_gc.interval, got %v", err)
+	}
+}
+
+func TestValidateRejectsNegativeOCICacheGCMinBlobAge(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Images.OCICacheGC.MinBlobAge = "-1s"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cannot be negative") {
+		t.Fatalf("expected non-negative validation error for images.oci_cache_gc.min_blob_age, got %v", err)
+	}
+}
+
+func TestValidateTrimsImageAutoDeleteAllowedPatterns(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Images.AutoDelete.Allowed = []string{"  docker.io/library/*  ", "   ", "ghcr.io/kernel/*"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected image auto delete allow list to validate, got %v", err)
+	}
+	if cfg.Images.AutoDelete.Allowed[0] != "docker.io/library/*" {
+		t.Fatalf("expected first allow pattern to be trimmed, got %q", cfg.Images.AutoDelete.Allowed[0])
+	}
+	if cfg.Images.AutoDelete.Allowed[1] != "" {
+		t.Fatalf("expected whitespace-only allow pattern to trim to empty string, got %q", cfg.Images.AutoDelete.Allowed[1])
+	}
+	if cfg.Images.AutoDelete.Allowed[2] != "ghcr.io/kernel/*" {
+		t.Fatalf("expected third allow pattern to be trimmed, got %q", cfg.Images.AutoDelete.Allowed[2])
+	}
+}
+
+func TestValidateRejectsEmptyActiveBallooningDurations(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Hypervisor.Memory.ActiveBallooning.PollInterval = "   "
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "poll_interval must not be empty") {
+		t.Fatalf("expected poll_interval empty validation error, got %v", err)
+	}
+
+	cfg = defaultConfig()
+	cfg.Hypervisor.Memory.ActiveBallooning.PerVmCooldown = ""
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "per_vm_cooldown must not be empty") {
+		t.Fatalf("expected per_vm_cooldown empty validation error, got %v", err)
+	}
+}
+
+func TestDefaultConfigActiveBallooningMatchesGoDefaults(t *testing.T) {
+	cfg := defaultConfig()
+	want := guestmemory.DefaultActiveBallooningConfig()
+
+	parse := func(value string) int64 {
+		t.Helper()
+
+		var size datasize.ByteSize
+		if err := size.UnmarshalText([]byte(value)); err != nil {
+			t.Fatalf("parse default byte size %q: %v", value, err)
+		}
+		return int64(size)
+	}
+
+	if got := parse(cfg.Hypervisor.Memory.ActiveBallooning.ProtectedFloorMinBytes); got != want.ProtectedFloorMinBytes {
+		t.Fatalf("protected floor default mismatch: got %d want %d", got, want.ProtectedFloorMinBytes)
+	}
+	if got := parse(cfg.Hypervisor.Memory.ActiveBallooning.MinAdjustmentBytes); got != want.MinAdjustmentBytes {
+		t.Fatalf("min adjustment default mismatch: got %d want %d", got, want.MinAdjustmentBytes)
+	}
+	if got := parse(cfg.Hypervisor.Memory.ActiveBallooning.PerVmMaxStepBytes); got != want.PerVMMaxStepBytes {
+		t.Fatalf("per-vm max step default mismatch: got %d want %d", got, want.PerVMMaxStepBytes)
+	}
+}
+
+func TestValidateAllowsLZ4CompressionDefaultWithImplicitLevel(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Snapshot.CompressionDefault.Enabled = true
+	cfg.Snapshot.CompressionDefault.Algorithm = "LZ4"
+	cfg.Snapshot.CompressionDefault.Level = nil
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected lz4 compression default to validate, got %v", err)
+	}
+	if cfg.Snapshot.CompressionDefault.Algorithm != "lz4" {
+		t.Fatalf("expected algorithm to normalize to lowercase, got %q", cfg.Snapshot.CompressionDefault.Algorithm)
+	}
+}
+
+func TestValidateAllowsExplicitLZ4CompressionLevelRange(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Snapshot.CompressionDefault.Enabled = true
+	cfg.Snapshot.CompressionDefault.Algorithm = "lz4"
+	cfg.Snapshot.CompressionDefault.Level = intPtr(9)
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected lz4 level to validate, got %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidLZ4CompressionLevel(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Snapshot.CompressionDefault.Enabled = true
+	cfg.Snapshot.CompressionDefault.Algorithm = "lz4"
+	cfg.Snapshot.CompressionDefault.Level = intPtr(10)
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error for invalid lz4 level")
+	}
+}
+
+func TestValidateAllowsDisabledSnapshotCompressionDefaultWithoutValidAlgorithm(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Snapshot.CompressionDefault.Enabled = false
+	cfg.Snapshot.CompressionDefault.Algorithm = "definitely-not-real"
+	cfg.Snapshot.CompressionDefault.Level = intPtr(999)
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected disabled snapshot compression default to ignore algorithm/level, got %v", err)
+	}
+}
+
+func TestValidateBuildersConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"defaults", func(c *Config) {}, ""},
+		{"negative max count", func(c *Config) { c.Builders.MaxCount = -1 }, "builders.max_count"},
+		{"zero default disk size", func(c *Config) { c.Builders.DefaultDiskSizeGb = 0 }, "builders.default_disk_size_gb"},
+		{"negative max disk size", func(c *Config) { c.Builders.MaxDiskSizeGb = -1 }, "builders.max_disk_size_gb"},
+		{"default exceeds max", func(c *Config) { c.Builders.MaxDiskSizeGb = 10 }, "exceeds"},
+		{"invalid idle ttl", func(c *Config) { c.Builders.IdleTTL = "not-a-duration" }, "builders.idle_ttl"},
+		{"negative idle ttl", func(c *Config) { c.Builders.IdleTTL = "-1h" }, "builders.idle_ttl"},
+		{"idle ttl set", func(c *Config) { c.Builders.IdleTTL = "24h" }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected valid config, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+
+	cfg := defaultConfig()
+	cfg.Builders.IdleTTL = "24h"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid idle ttl, got %v", err)
+	}
+	if cfg.Builders.IdleTTLDuration != 24*time.Hour {
+		t.Fatalf("expected parsed idle ttl 24h, got %s", cfg.Builders.IdleTTLDuration)
+	}
+}

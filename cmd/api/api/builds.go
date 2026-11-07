@@ -1,0 +1,439 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+
+	"github.com/kernel/hypeman/lib/builders"
+	"github.com/kernel/hypeman/lib/builds"
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/logger"
+	"github.com/kernel/hypeman/lib/oapi"
+	"github.com/kernel/hypeman/lib/tags"
+)
+
+// ListBuilds returns all builds
+func (s *ApiService) ListBuilds(ctx context.Context, request oapi.ListBuildsRequestObject) (oapi.ListBuildsResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	domainBuilds, err := s.BuildManager.ListBuilds(ctx)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to list builds", "error", err)
+		return oapi.ListBuilds500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to list builds",
+		}, nil
+	}
+
+	oapiBuilds := make([]oapi.Build, 0, len(domainBuilds))
+	for _, b := range domainBuilds {
+		if b == nil || !matchesTagsFilter(b.Tags, request.Params.Tags) {
+			continue
+		}
+		oapiBuilds = append(oapiBuilds, buildToOAPI(b))
+	}
+
+	return oapi.ListBuilds200JSONResponse(oapiBuilds), nil
+}
+
+// CreateBuild creates a new build job
+func (s *ApiService) CreateBuild(ctx context.Context, request oapi.CreateBuildRequestObject) (oapi.CreateBuildResponseObject, error) {
+	if s.Config != nil && s.Config.MacOSOnly {
+		return oapi.CreateBuild501JSONResponse{Code: "unsupported", Message: "Linux builder VMs are unavailable in macOS-only mode"}, nil
+	}
+	log := logger.FromContext(ctx)
+
+	// Parse multipart form fields
+	var sourceData []byte
+	var baseImageDigest, builderID, cacheScope, dockerfile, globalCacheKey, imageName string
+	var timeoutSeconds, memoryMB, cpus int
+	var isAdminBuild bool
+	var secrets []builds.SecretRef
+	var resourceTags map[string]string
+
+	for {
+		part, err := request.Body.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "invalid_request",
+				Message: "failed to parse multipart form",
+			}, nil
+		}
+
+		switch part.FormName() {
+		case "source":
+			sourceData, err = io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_source",
+					Message: "failed to read source data",
+				}, nil
+			}
+		case "base_image_digest":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read base_image_digest field",
+				}, nil
+			}
+			baseImageDigest = string(data)
+		case "builder_id":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read builder_id field",
+				}, nil
+			}
+			builderID = string(data)
+		case "cache_scope":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read cache_scope field",
+				}, nil
+			}
+			cacheScope = string(data)
+		case "dockerfile":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read dockerfile field",
+				}, nil
+			}
+			dockerfile = string(data)
+		case "timeout_seconds":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read timeout_seconds field",
+				}, nil
+			}
+			if v, err := strconv.Atoi(string(data)); err == nil {
+				timeoutSeconds = v
+			}
+		case "memory_mb":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read memory_mb field",
+				}, nil
+			}
+			if v, err := strconv.Atoi(string(data)); err == nil {
+				memoryMB = v
+			}
+		case "cpus":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read cpus field",
+				}, nil
+			}
+			if v, err := strconv.Atoi(string(data)); err == nil {
+				cpus = v
+			}
+		case "secrets":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read secrets field",
+				}, nil
+			}
+			if err := json.Unmarshal(data, &secrets); err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "secrets must be a JSON array of {\"id\": \"...\", \"env_var\": \"...\"} objects",
+				}, nil
+			}
+		case "is_admin_build":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read is_admin_build field",
+				}, nil
+			}
+			isAdminBuild = string(data) == "true" || string(data) == "1"
+		case "global_cache_key":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read global_cache_key field",
+				}, nil
+			}
+			globalCacheKey = string(data)
+		case "image_name":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read image_name field",
+				}, nil
+			}
+			imageName = string(data)
+		case "tags":
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "failed to read tags field",
+				}, nil
+			}
+			parsed, err := parseTagsJSON(string(data))
+			if err != nil {
+				return oapi.CreateBuild400JSONResponse{
+					Code:    "invalid_request",
+					Message: "tags must be a JSON object with string key-value pairs",
+				}, nil
+			}
+			resourceTags = parsed
+		}
+		part.Close()
+	}
+
+	if len(sourceData) == 0 {
+		return oapi.CreateBuild400JSONResponse{
+			Code:    "invalid_request",
+			Message: "source is required",
+		}, nil
+	}
+
+	// Validate image_name early so the user gets a fast 400 instead of
+	// a successful build that silently falls back to builds/{id}.
+	if imageName != "" {
+		if _, err := images.ParseNormalizedRef(imageName); err != nil {
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("invalid image_name: %v", err),
+			}, nil
+		}
+	}
+
+	// Note: Dockerfile validation happens in the builder agent.
+	// It will check if Dockerfile is in the source tarball or provided via dockerfile parameter.
+
+	// Build domain request
+	domainReq := builds.CreateBuildRequest{
+		BaseImageDigest: baseImageDigest,
+		BuilderID:       builderID,
+		CacheScope:      cacheScope,
+		Dockerfile:      dockerfile,
+		Secrets:         secrets,
+		IsAdminBuild:    isAdminBuild,
+		GlobalCacheKey:  globalCacheKey,
+		ImageName:       imageName,
+		Tags:            resourceTags,
+	}
+
+	// Apply build policy if any field was provided
+	if timeoutSeconds > 0 || memoryMB > 0 || cpus > 0 {
+		domainReq.BuildPolicy = &builds.BuildPolicy{
+			TimeoutSeconds: timeoutSeconds,
+			MemoryMB:       memoryMB,
+			CPUs:           cpus,
+		}
+		if err := domainReq.BuildPolicy.Validate(); err != nil {
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		}
+	}
+
+	build, err := s.BuildManager.CreateBuild(ctx, domainReq, sourceData)
+	if err != nil {
+		switch {
+		case errors.Is(err, tags.ErrInvalidTags):
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "invalid_request",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, builds.ErrDockerfileRequired):
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "dockerfile_required",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, builds.ErrInvalidSource):
+			return oapi.CreateBuild400JSONResponse{
+				Code:    "invalid_source",
+				Message: err.Error(),
+			}, nil
+		case errors.Is(err, builders.ErrNotFound):
+			return oapi.CreateBuild404JSONResponse{
+				Code:    "not_found",
+				Message: "builder not found",
+			}, nil
+		case errors.Is(err, builders.ErrInUse):
+			return oapi.CreateBuild409JSONResponse{
+				Code:    "conflict",
+				Message: "builder is in use",
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to create build", "error", err)
+			return oapi.CreateBuild500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to create build",
+			}, nil
+		}
+	}
+
+	return oapi.CreateBuild202JSONResponse(buildToOAPI(build)), nil
+}
+
+// GetBuild gets build details
+func (s *ApiService) GetBuild(ctx context.Context, request oapi.GetBuildRequestObject) (oapi.GetBuildResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	build, err := s.BuildManager.GetBuild(ctx, request.Id)
+	if err != nil {
+		if errors.Is(err, builds.ErrNotFound) {
+			return oapi.GetBuild404JSONResponse{
+				Code:    "not_found",
+				Message: "build not found",
+			}, nil
+		}
+		log.ErrorContext(ctx, "failed to get build", "error", err, "id", request.Id)
+		return oapi.GetBuild500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to get build",
+		}, nil
+	}
+
+	return oapi.GetBuild200JSONResponse(buildToOAPI(build)), nil
+}
+
+// CancelBuild cancels a build
+func (s *ApiService) CancelBuild(ctx context.Context, request oapi.CancelBuildRequestObject) (oapi.CancelBuildResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	err := s.BuildManager.CancelBuild(ctx, request.Id)
+	if err != nil {
+		switch {
+		case errors.Is(err, builds.ErrNotFound):
+			return oapi.CancelBuild404JSONResponse{
+				Code:    "not_found",
+				Message: "build not found",
+			}, nil
+		case errors.Is(err, builds.ErrBuildInProgress):
+			return oapi.CancelBuild409JSONResponse{
+				Code:    "conflict",
+				Message: "build already in progress",
+			}, nil
+		default:
+			log.ErrorContext(ctx, "failed to cancel build", "error", err, "id", request.Id)
+			return oapi.CancelBuild500JSONResponse{
+				Code:    "internal_error",
+				Message: "failed to cancel build",
+			}, nil
+		}
+	}
+
+	return oapi.CancelBuild204Response{}, nil
+}
+
+// GetBuildEvents streams build events via SSE
+// With follow=false (default), streams existing logs then closes
+// With follow=true, continues streaming until build completes
+func (s *ApiService) GetBuildEvents(ctx context.Context, request oapi.GetBuildEventsRequestObject) (oapi.GetBuildEventsResponseObject, error) {
+	log := logger.FromContext(ctx)
+
+	// Parse follow parameter (default false)
+	follow := false
+	if request.Params.Follow != nil {
+		follow = *request.Params.Follow
+	}
+
+	eventChan, err := s.BuildManager.StreamBuildEvents(ctx, request.Id, follow)
+	if err != nil {
+		if errors.Is(err, builds.ErrNotFound) {
+			return oapi.GetBuildEvents404JSONResponse{
+				Code:    "not_found",
+				Message: "build not found",
+			}, nil
+		}
+		log.ErrorContext(ctx, "failed to stream build events", "error", err, "id", request.Id)
+		return oapi.GetBuildEvents500JSONResponse{
+			Code:    "internal_error",
+			Message: "failed to stream build events",
+		}, nil
+	}
+
+	return buildEventsStreamResponse{eventChan: eventChan}, nil
+}
+
+// buildEventsStreamResponse implements oapi.GetBuildEventsResponseObject with proper SSE streaming
+type buildEventsStreamResponse struct {
+	eventChan <-chan builds.BuildEvent
+}
+
+func (r buildEventsStreamResponse) VisitGetBuildEventsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	w.WriteHeader(200)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming not supported")
+	}
+
+	for event := range r.eventChan {
+		jsonEvent, err := json.Marshal(event)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", jsonEvent)
+		flusher.Flush()
+	}
+	return nil
+}
+
+// buildToOAPI converts a domain Build to OAPI Build
+func buildToOAPI(b *builds.Build) oapi.Build {
+	oapiBuild := oapi.Build{
+		Id:                b.ID,
+		Status:            oapi.BuildStatus(b.Status),
+		Tags:              toOAPITags(b.Tags),
+		QueuePosition:     b.QueuePosition,
+		ImageDigest:       b.ImageDigest,
+		ImageRef:          b.ImageRef,
+		Error:             b.Error,
+		CreatedAt:         b.CreatedAt,
+		StartedAt:         b.StartedAt,
+		CompletedAt:       b.CompletedAt,
+		DurationMs:        b.DurationMS,
+		BuilderInstanceId: b.BuilderInstanceID,
+		BuilderId:         b.BuilderID,
+	}
+
+	if b.Provenance != nil {
+		oapiBuild.Provenance = &oapi.BuildProvenance{
+			BaseImageDigest: &b.Provenance.BaseImageDigest,
+			SourceHash:      &b.Provenance.SourceHash,
+			BuildkitVersion: &b.Provenance.BuildkitVersion,
+			Timestamp:       &b.Provenance.Timestamp,
+		}
+		if len(b.Provenance.LockfileHashes) > 0 {
+			oapiBuild.Provenance.LockfileHashes = &b.Provenance.LockfileHashes
+		}
+	}
+
+	return oapiBuild
+}

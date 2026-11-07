@@ -1,0 +1,579 @@
+package instances
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/kernel/hypeman/lib/autostandby"
+	"github.com/kernel/hypeman/lib/egressproxy"
+	"github.com/kernel/hypeman/lib/healthcheck"
+	snapshotstore "github.com/kernel/hypeman/lib/snapshot"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestValidateUpdateInstanceRequest(t *testing.T) {
+	baseMeta := &metadata{
+		StoredMetadata: StoredMetadata{
+			NetworkEgress: &NetworkEgressPolicy{Enabled: true},
+			Credentials: map[string]CredentialPolicy{
+				"OUTBOUND_OPENAI_KEY": {
+					Source: CredentialSource{Env: "OUTBOUND_OPENAI_KEY"},
+				},
+			},
+		},
+	}
+
+	t.Run("requires at least one update field", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidRequest)
+		assert.Contains(t, err.Error(), "env, auto_standby, health_check, restart_policy, ttl, and/or expires_at")
+	})
+
+	t.Run("allows disabling expiration", func(t *testing.T) {
+		ttl := time.Duration(0)
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{TTL: &ttl})
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects conflicting expiration fields", func(t *testing.T) {
+		ttl := time.Hour
+		expiresAt := time.Now().Add(time.Hour)
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{TTL: &ttl, ExpiresAt: &expiresAt})
+		require.ErrorIs(t, err, ErrInvalidRequest)
+	})
+
+	t.Run("rejects negative ttl", func(t *testing.T) {
+		ttl := -time.Second
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{TTL: &ttl})
+		require.ErrorIs(t, err, ErrInvalidRequest)
+	})
+
+	t.Run("rejects past absolute expiration consistently", func(t *testing.T) {
+		now := time.Now()
+		_, _, err := resolveExpirationUpdate(baseMeta, UpdateInstanceRequest{ExpiresAt: &now}, now)
+		require.ErrorIs(t, err, ErrInvalidExpiresAt)
+	})
+
+	t.Run("rejects instances without credential backed envs", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(&metadata{}, UpdateInstanceRequest{
+			Env: map[string]string{"OUTBOUND_OPENAI_KEY": "rotated"},
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidRequest)
+		assert.Contains(t, err.Error(), "no credential-backed env vars")
+	})
+
+	t.Run("rejects unrelated env keys", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{
+			Env: map[string]string{"UNRELATED_KEY": "value"},
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidRequest)
+		assert.Contains(t, err.Error(), "UNRELATED_KEY")
+		assert.Contains(t, err.Error(), "OUTBOUND_OPENAI_KEY")
+	})
+
+	t.Run("allows credential source env keys", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{
+			Env: map[string]string{"OUTBOUND_OPENAI_KEY": "rotated"},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("allows auto standby without env changes", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{
+			AutoStandby: &autostandby.Policy{
+				Enabled:     true,
+				IdleTimeout: "5m",
+			},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("allows exec health check without env changes", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(baseMeta, UpdateInstanceRequest{
+			HealthCheck: &healthcheck.Policy{
+				Type: healthcheck.TypeExec,
+				Exec: &healthcheck.ExecCheck{Command: []string{"true"}},
+			},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects network health check without networking", func(t *testing.T) {
+		err := validateUpdateInstanceRequest(&metadata{}, UpdateInstanceRequest{
+			HealthCheck: &healthcheck.Policy{
+				Type: healthcheck.TypeTCP,
+				TCP:  &healthcheck.TCPCheck{Port: 8080},
+			},
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidRequest)
+		assert.Contains(t, err.Error(), "network.enabled")
+	})
+}
+
+type fakeUpdateInstanceRulesService struct {
+	calls [][]egressproxy.HeaderInjectRuleConfig
+	errs  []error
+}
+
+func (f *fakeUpdateInstanceRulesService) UpdateInstanceRules(_ context.Context, _ string, rules []egressproxy.HeaderInjectRuleConfig) error {
+	copied := make([]egressproxy.HeaderInjectRuleConfig, len(rules))
+	copy(copied, rules)
+	f.calls = append(f.calls, copied)
+
+	if len(f.errs) == 0 {
+		return nil
+	}
+	err := f.errs[0]
+	f.errs = f.errs[1:]
+	return err
+}
+
+func TestApplyUpdatedInstanceEnvWithoutProxyService(t *testing.T) {
+	t.Parallel()
+
+	meta := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id:  "inst-no-proxy",
+			Env: map[string]string{"OUTBOUND_OPENAI_KEY": "old"},
+		},
+	}
+	prevEnv := cloneEnvMap(meta.Env)
+	nextEnv := map[string]string{"OUTBOUND_OPENAI_KEY": "new"}
+
+	err := applyUpdatedInstanceEnv(context.Background(), nil, meta.Id, meta, prevEnv, nextEnv, func(saved *metadata) error {
+		t.Fatalf("save should not be called when proxy service is unavailable")
+		return nil
+	}, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "egress proxy service unavailable")
+	assert.Equal(t, prevEnv, meta.Env)
+}
+
+func TestApplyUpdatedInstanceEnvRollsBackRulesOnSaveFailure(t *testing.T) {
+	t.Parallel()
+
+	meta := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id:            "inst-save-rollback",
+			NetworkEgress: &NetworkEgressPolicy{Enabled: true},
+			Credentials: map[string]CredentialPolicy{
+				"OUTBOUND_OPENAI_KEY": {
+					Source: CredentialSource{Env: "OUTBOUND_OPENAI_KEY"},
+					Inject: []CredentialInjectRule{{
+						As: CredentialInjectAs{
+							Header: "Authorization",
+							Format: "Bearer ${value}",
+						},
+					}},
+				},
+			},
+			Env: map[string]string{"OUTBOUND_OPENAI_KEY": "old"},
+		},
+	}
+	prevEnv := cloneEnvMap(meta.Env)
+	nextEnv := map[string]string{"OUTBOUND_OPENAI_KEY": "new"}
+	svc := &fakeUpdateInstanceRulesService{}
+	saveErr := errors.New("disk full")
+
+	err := applyUpdatedInstanceEnv(context.Background(), nil, meta.Id, meta, prevEnv, nextEnv, func(*metadata) error {
+		return saveErr
+	}, svc)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "save metadata")
+	assert.ErrorContains(t, err, saveErr.Error())
+	assert.Equal(t, prevEnv, meta.Env)
+	require.Len(t, svc.calls, 2)
+	assert.Equal(t, buildEgressProxyInjectRules(meta.NetworkEgress, meta.Credentials, nextEnv), svc.calls[0])
+	assert.Equal(t, buildEgressProxyInjectRules(meta.NetworkEgress, meta.Credentials, prevEnv), svc.calls[1])
+}
+
+func TestApplyUpdatedInstanceEnvReturnsRollbackFailure(t *testing.T) {
+	t.Parallel()
+
+	meta := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id:            "inst-double-failure",
+			NetworkEgress: &NetworkEgressPolicy{Enabled: true},
+			Credentials: map[string]CredentialPolicy{
+				"OUTBOUND_OPENAI_KEY": {
+					Source: CredentialSource{Env: "OUTBOUND_OPENAI_KEY"},
+					Inject: []CredentialInjectRule{{
+						As: CredentialInjectAs{
+							Header: "Authorization",
+							Format: "Bearer ${value}",
+						},
+					}},
+				},
+			},
+			Env: map[string]string{"OUTBOUND_OPENAI_KEY": "old"},
+		},
+	}
+	prevEnv := cloneEnvMap(meta.Env)
+	nextEnv := map[string]string{"OUTBOUND_OPENAI_KEY": "new"}
+	saveErr := errors.New("save failed")
+	rollbackErr := errors.New("rollback failed")
+	svc := &fakeUpdateInstanceRulesService{errs: []error{nil, rollbackErr}}
+
+	err := applyUpdatedInstanceEnv(context.Background(), nil, meta.Id, meta, prevEnv, nextEnv, func(*metadata) error {
+		return saveErr
+	}, svc)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "save metadata")
+	assert.ErrorContains(t, err, saveErr.Error())
+	assert.ErrorContains(t, err, rollbackErr.Error())
+	assert.Equal(t, prevEnv, meta.Env)
+	require.Len(t, svc.calls, 2)
+}
+
+func TestApplyUpdatedInstanceEnvSavesAutoStandbyAlongsideEnvWithoutMutatingOriginal(t *testing.T) {
+	t.Parallel()
+
+	original := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id:            "inst-autostandby-copy",
+			NetworkEgress: &NetworkEgressPolicy{Enabled: true},
+			Credentials: map[string]CredentialPolicy{
+				"OUTBOUND_OPENAI_KEY": {
+					Source: CredentialSource{Env: "OUTBOUND_OPENAI_KEY"},
+					Inject: []CredentialInjectRule{{
+						As: CredentialInjectAs{
+							Header: "Authorization",
+							Format: "Bearer ${value}",
+						},
+					}},
+				},
+			},
+			Env: map[string]string{"OUTBOUND_OPENAI_KEY": "old"},
+			AutoStandby: &autostandby.Policy{
+				Enabled:     false,
+				IdleTimeout: "5m0s",
+			},
+		},
+	}
+	updated := deepCopyMetadata(original)
+	updated.AutoStandby = &autostandby.Policy{
+		Enabled:                true,
+		IdleTimeout:            "10m0s",
+		IgnoreSourceCIDRs:      []string{"10.0.0.0/8"},
+		IgnoreDestinationPorts: []uint16{22},
+	}
+
+	prevEnv := cloneEnvMap(updated.Env)
+	nextEnv := map[string]string{"OUTBOUND_OPENAI_KEY": "new"}
+	svc := &fakeUpdateInstanceRulesService{}
+
+	var saved *metadata
+	err := applyUpdatedInstanceEnv(context.Background(), nil, updated.Id, updated, prevEnv, nextEnv, func(meta *metadata) error {
+		saved = deepCopyMetadata(meta)
+		return nil
+	}, svc)
+	require.NoError(t, err)
+
+	require.NotNil(t, saved)
+	require.NotNil(t, saved.AutoStandby)
+	assert.True(t, saved.AutoStandby.Enabled)
+	assert.Equal(t, "10m0s", saved.AutoStandby.IdleTimeout)
+	assert.Equal(t, []string{"10.0.0.0/8"}, saved.AutoStandby.IgnoreSourceCIDRs)
+	assert.Equal(t, []uint16{22}, saved.AutoStandby.IgnoreDestinationPorts)
+	assert.Equal(t, nextEnv, saved.Env)
+
+	require.NotNil(t, original.AutoStandby)
+	assert.False(t, original.AutoStandby.Enabled)
+	assert.Equal(t, "5m0s", original.AutoStandby.IdleTimeout)
+	assert.Equal(t, map[string]string{"OUTBOUND_OPENAI_KEY": "old"}, original.Env)
+}
+
+func TestDeepCopyMetadataPreservesPendingStandbyCompression(t *testing.T) {
+	t.Parallel()
+
+	level := 5
+	notBefore := time.Now().Add(3 * time.Minute)
+	original := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id: "inst-pending-copy",
+			PendingStandbyCompression: &PendingStandbyCompression{
+				Policy: snapshotstore.SnapshotCompressionConfig{
+					Enabled:   true,
+					Algorithm: snapshotstore.SnapshotCompressionAlgorithmLz4,
+					Level:     &level,
+				},
+				NotBefore: notBefore,
+			},
+		},
+	}
+
+	cloned := deepCopyMetadata(original)
+	require.NotNil(t, cloned)
+	require.NotNil(t, cloned.PendingStandbyCompression)
+	require.NotSame(t, original.PendingStandbyCompression, cloned.PendingStandbyCompression)
+	require.NotNil(t, cloned.PendingStandbyCompression.Policy.Level)
+	assert.Equal(t, level, *cloned.PendingStandbyCompression.Policy.Level)
+	assert.Equal(t, notBefore, cloned.PendingStandbyCompression.NotBefore)
+
+	*cloned.PendingStandbyCompression.Policy.Level = 1
+	cloned.PendingStandbyCompression.NotBefore = time.Now()
+
+	require.NotNil(t, original.PendingStandbyCompression.Policy.Level)
+	assert.Equal(t, 5, *original.PendingStandbyCompression.Policy.Level)
+	assert.Equal(t, notBefore, original.PendingStandbyCompression.NotBefore)
+}
+
+func TestManagerUpdateInstanceAutoStandbyOnlyPublishesLifecycleUpdate(t *testing.T) {
+	t.Parallel()
+
+	manager, _ := setupTestManager(t)
+	id := "inst-auto-standby-update"
+	require.NoError(t, manager.ensureDirectories(id))
+	meta := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id:         id,
+			Name:       id,
+			CreatedAt:  time.Now(),
+			DataDir:    manager.paths.InstanceDir(id),
+			SocketPath: manager.paths.InstanceSocket(id, "cloud-hypervisor.sock"),
+			AutoStandby: &autostandby.Policy{
+				Enabled:     false,
+				IdleTimeout: "5m0s",
+			},
+		},
+	}
+	require.NoError(t, manager.saveMetadata(meta))
+
+	events, unsubscribe := manager.SubscribeLifecycleEvents(LifecycleEventConsumerAutoStandby)
+	defer unsubscribe()
+
+	updated, err := manager.UpdateInstance(context.Background(), id, UpdateInstanceRequest{
+		AutoStandby: &autostandby.Policy{
+			Enabled:     true,
+			IdleTimeout: "10m",
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.NotNil(t, updated.AutoStandby)
+	assert.True(t, updated.AutoStandby.Enabled)
+
+	select {
+	case event := <-events:
+		assert.Equal(t, LifecycleEventUpdate, event.Action)
+		assert.Equal(t, id, event.InstanceID)
+		require.NotNil(t, event.Instance)
+		require.NotNil(t, event.Instance.AutoStandby)
+		assert.True(t, event.Instance.AutoStandby.Enabled)
+		assert.Equal(t, "10m0s", event.Instance.AutoStandby.IdleTimeout)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for lifecycle update event")
+	}
+}
+
+func TestManagerUpdateInstanceHealthCheckOnlyPublishesLifecycleUpdate(t *testing.T) {
+	t.Parallel()
+
+	manager, _ := setupTestManager(t)
+	id := "inst-health-check-update"
+	require.NoError(t, manager.ensureDirectories(id))
+	meta := &metadata{
+		StoredMetadata: StoredMetadata{
+			Id:             id,
+			Name:           id,
+			CreatedAt:      time.Now(),
+			DataDir:        manager.paths.InstanceDir(id),
+			SocketPath:     manager.paths.InstanceSocket(id, "cloud-hypervisor.sock"),
+			NetworkEnabled: true,
+			HealthCheck: &healthcheck.Policy{
+				Type: healthcheck.TypeExec,
+				Exec: &healthcheck.ExecCheck{Command: []string{"true"}},
+			},
+		},
+		HealthCheckRuntime: &healthcheck.Runtime{
+			Status:               healthcheck.StatusHealthy,
+			ConsecutiveSuccesses: 3,
+		},
+	}
+	require.NoError(t, manager.saveMetadata(meta))
+
+	events, unsubscribe := manager.SubscribeLifecycleEvents(LifecycleEventConsumerHealthCheck)
+	defer unsubscribe()
+
+	updated, err := manager.UpdateInstance(context.Background(), id, UpdateInstanceRequest{
+		HealthCheck: &healthcheck.Policy{
+			Type: healthcheck.TypeTCP,
+			TCP:  &healthcheck.TCPCheck{Port: 8080},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.NotNil(t, updated.HealthCheck)
+	assert.Equal(t, healthcheck.TypeTCP, updated.HealthCheck.Type)
+	assert.Nil(t, updated.HealthCheckRuntime)
+
+	select {
+	case event := <-events:
+		assert.Equal(t, LifecycleEventUpdate, event.Action)
+		assert.Equal(t, id, event.InstanceID)
+		require.NotNil(t, event.Instance)
+		require.NotNil(t, event.Instance.HealthCheck)
+		assert.Equal(t, healthcheck.TypeTCP, event.Instance.HealthCheck.Type)
+		assert.Nil(t, event.Instance.HealthCheckRuntime)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for lifecycle update event")
+	}
+}
+
+func TestManagerUpdateInstanceTTLIsRelativeToUpdate(t *testing.T) {
+	t.Parallel()
+
+	m, _ := setupTestManager(t)
+	requestTime := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	commitTime := requestTime.Add(2 * time.Minute)
+	nowCalls := 0
+	m.now = func() time.Time {
+		nowCalls++
+		if nowCalls == 1 {
+			return requestTime
+		}
+		return commitTime
+	}
+	id := "inst-update-ttl"
+	require.NoError(t, m.ensureDirectories(id))
+	oldExpiration := requestTime.Add(time.Hour)
+	require.NoError(t, m.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+		Id:        id,
+		Name:      id,
+		CreatedAt: requestTime.Add(-24 * time.Hour),
+		ExpiresAt: &oldExpiration,
+		DataDir:   m.paths.InstanceDir(id),
+	}}))
+
+	ttl := 6 * time.Hour
+	updated, err := m.UpdateInstance(context.Background(), id, UpdateInstanceRequest{TTL: &ttl})
+	require.NoError(t, err)
+	require.NotNil(t, updated.ExpiresAt)
+	assert.GreaterOrEqual(t, nowCalls, 2)
+	assert.Equal(t, commitTime.Add(ttl), *updated.ExpiresAt)
+
+	restarted := &manager{paths: m.paths}
+	persisted, err := restarted.loadMetadata(id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted.ExpiresAt)
+	assert.Equal(t, commitTime.Add(ttl), *persisted.ExpiresAt)
+}
+
+func TestManagerUpdateInstanceRejectsExpirationThatPassesBeforeCommit(t *testing.T) {
+	t.Parallel()
+
+	m, _ := setupTestManager(t)
+	requestTime := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	commitTime := requestTime.Add(2 * time.Minute)
+	nowCalls := 0
+	m.now = func() time.Time {
+		nowCalls++
+		if nowCalls == 1 {
+			return requestTime
+		}
+		return commitTime
+	}
+	id := "inst-expires-during-update"
+	expiresAt := requestTime.Add(time.Minute)
+	require.NoError(t, m.ensureDirectories(id))
+	require.NoError(t, m.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+		Id:        id,
+		Name:      id,
+		CreatedAt: requestTime.Add(-time.Hour),
+		ExpiresAt: &expiresAt,
+		DataDir:   m.paths.InstanceDir(id),
+	}}))
+
+	ttl := time.Hour
+	_, err := m.UpdateInstance(context.Background(), id, UpdateInstanceRequest{TTL: &ttl})
+	require.ErrorIs(t, err, ErrInstanceExpired)
+	assert.GreaterOrEqual(t, nowCalls, 2)
+
+	persisted, err := m.loadMetadata(id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted.ExpiresAt)
+	assert.Equal(t, expiresAt, *persisted.ExpiresAt)
+}
+
+func TestManagerUpdateInstanceDisablePreventsStaleReaperDelete(t *testing.T) {
+	t.Parallel()
+
+	manager, _ := setupTestManager(t)
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	id := "inst-disable-expiration"
+	require.NoError(t, manager.ensureDirectories(id))
+	expiresAt := now.Add(time.Minute)
+	require.NoError(t, manager.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+		Id:        id,
+		Name:      id,
+		CreatedAt: now.Add(-time.Hour),
+		ExpiresAt: &expiresAt,
+		DataDir:   manager.paths.InstanceDir(id),
+	}}))
+
+	disable := time.Duration(0)
+	updated, err := manager.UpdateInstance(context.Background(), id, UpdateInstanceRequest{TTL: &disable})
+	require.NoError(t, err)
+	assert.Nil(t, updated.ExpiresAt)
+
+	now = now.Add(2 * time.Hour)
+	manager.reapExpiredInstances(context.Background())
+	_, err = manager.loadMetadata(id)
+	require.NoError(t, err)
+}
+
+func TestManagerUpdateInstanceExpirationLosesAfterDeadline(t *testing.T) {
+	t.Parallel()
+
+	manager, _ := setupTestManager(t)
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	id := "inst-expired-before-update"
+	require.NoError(t, manager.ensureDirectories(id))
+	expiresAt := now
+	require.NoError(t, manager.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+		Id:        id,
+		Name:      id,
+		CreatedAt: now.Add(-time.Hour),
+		ExpiresAt: &expiresAt,
+		DataDir:   manager.paths.InstanceDir(id),
+	}}))
+
+	ttl := time.Hour
+	_, err := manager.UpdateInstance(context.Background(), id, UpdateInstanceRequest{TTL: &ttl})
+	require.ErrorIs(t, err, ErrInstanceExpired)
+}
+
+func TestManagerUpdateInstanceExpirationLosesAfterReaperDelete(t *testing.T) {
+	t.Parallel()
+
+	manager, _ := setupTestManager(t)
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	id := "inst-reaped-before-update"
+	require.NoError(t, manager.ensureDirectories(id))
+	expiresAt := now
+	require.NoError(t, manager.saveMetadata(&metadata{StoredMetadata: StoredMetadata{
+		Id:        id,
+		Name:      id,
+		CreatedAt: now.Add(-time.Hour),
+		ExpiresAt: &expiresAt,
+		DataDir:   manager.paths.InstanceDir(id),
+	}}))
+
+	deleted, err := manager.reapExpiredInstance(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, deleted)
+
+	ttl := time.Hour
+	_, err = manager.UpdateInstance(context.Background(), id, UpdateInstanceRequest{TTL: &ttl})
+	require.ErrorIs(t, err, ErrNotFound)
+}

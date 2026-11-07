@@ -1,0 +1,573 @@
+name: Test
+
+on:
+  push: {}
+  workflow_dispatch:
+    inputs:
+      pr_head_repo:
+        description: "Fork repository containing the PR commit"
+        required: false
+        type: string
+      pr_head_sha:
+        description: "Exact PR commit to test"
+        required: false
+        type: string
+      pr_number:
+        description: "Pull request number for reporting the test result"
+        required: false
+        type: string
+
+# Every branch push triggers a full run and superseded runs used to keep
+# running, holding self-hosted slots that every repo on the shared pool
+# queues behind. Group by ref so a newer push cancels the older run for
+# that branch. main and workflow_dispatch runs get run_id, a unique group
+# each, because sharing a group is unsafe even with cancellation off:
+# GitHub cancels an existing pending run when a newer one enters the
+# group, which would drop a commit's only test signal.
+concurrency:
+  group: test-${{ (github.event_name == 'push' && github.ref != 'refs/heads/main') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref != 'refs/heads/main' }}
+
+# A slash-command dispatch supplies a fork repository and immutable commit SHA.
+# Normal push runs use the upstream repository and pushed ref.
+env:
+  TEST_PR_HEAD_REPO: ${{ inputs.pr_head_repo || github.repository }}
+  TEST_SOURCE_REPO: ${{ inputs.pr_head_repo || github.repository }}
+  TEST_SOURCE_REF: ${{ inputs.pr_head_sha || github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+          repository: ${{ env.TEST_SOURCE_REPO }}
+          ref: ${{ env.TEST_SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Clean workspace (preserve binary caches)
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx \
+            -e lib/vmm/binaries/ \
+            -e lib/hypervisor/firecracker/binaries/ \
+            -e lib/ingress/binaries/ \
+            -e bin/
+      
+      # Tests create a bridge and route per VM and clean up on success, but a
+      # run that dies mid-test (crash, timeout, superseded-run cancellation)
+      # leaks them, and enough leaked routes fail new tests on subnet
+      # conflicts. Each job sweeps before it starts. A live bridge can sit
+      # DOWN with no ports for minutes (Initialize creates it, the TAP only
+      # attaches after the rootfs build), so liveness alone cannot identify
+      # a leak; age can: a live bridge waits at most one go-test timeout for
+      # its TAP, while leaks are hours old. The sysfs dir timestamp is the
+      # interface's creation time, and a failed stat spares the interface.
+      # Nothing here ever fails the job.
+      - name: Clean leaked test networks
+        run: |
+          cutoff=$(( $(date +%s) - 3600 ))
+          ip -br link show | awk '$1 ~ /^(h[0-9a-f]{8}|hi[0-9a-f]+|hm[0-9a-f]+|hype-[a-z0-9]+)$/ && $2 == "DOWN" {print $1}' |
+          while read -r ifc; do
+            if [ -z "$(ls "/sys/class/net/$ifc/brif" 2>/dev/null)" ] \
+               && [ "$(stat -c %Y "/sys/class/net/$ifc" 2>/dev/null || echo "$cutoff")" -lt "$cutoff" ]; then
+              echo "$ifc"
+            fi
+          done > "$RUNNER_TEMP/net-sweep-dead"
+          while read -r ifc; do
+            sudo ip link del "$ifc" 2>/dev/null || true
+          done < "$RUNNER_TEMP/net-sweep-dead"
+          echo "swept $(wc -l < "$RUNNER_TEMP/net-sweep-dead") interfaces (DOWN, portless, older than 1h)"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          # Not necessary to upload cache on self-hosted runner(s)
+          # ~/go/pkg/mod and ~/.cache/go-build stay on disk between runs automatically.
+          cache: false
+          go-version-file: go.mod
+
+      - name: Check UFFD pager version
+        run: |
+          git fetch "https://github.com/${{ github.repository }}.git" main --depth=1
+          bash scripts/check-uffd-version.sh FETCH_HEAD
+      
+      - name: Install dependencies
+        run: |
+          set -xe
+          apt_update_with_retry() {
+            local attempts=5
+            local sleep_seconds=30
+            local n=1
+            while [ "$n" -le "$attempts" ]; do
+              if timeout 120s sudo apt-get update; then
+                return 0
+              fi
+              if [ "$n" -eq "$attempts" ]; then
+                return 1
+              fi
+              echo "apt-get update failed (attempt ${n}/${attempts}); retrying in ${sleep_seconds}s..."
+              sleep "$sleep_seconds"
+              n=$((n + 1))
+            done
+          }
+          if ! command -v mkfs.erofs &> /dev/null || \
+             ! command -v mkfs.ext4 &> /dev/null || \
+             ! command -v iptables &> /dev/null || \
+             ! command -v qemu-system-x86_64 &> /dev/null || \
+             ! qemu-system-x86_64 --version >/dev/null 2>&1 || \
+             ! command -v qemu-img &> /dev/null || \
+             ! command -v swtpm &> /dev/null || \
+             ! test -d /usr/share/OVMF; then
+            apt_update_with_retry
+            timeout 300s sudo apt-get install -y erofs-utils e2fsprogs iptables ovmf qemu-system-x86 qemu-utils swtpm
+          fi
+          if test -f /usr/share/OVMF/OVMF_CODE_4M.secboot.fd && test -f /usr/share/OVMF/OVMF_VARS_4M.ms.fd; then
+            ovmf_code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+            ovmf_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
+          elif test -f /usr/share/OVMF/OVMF_CODE.secboot.fd && test -f /usr/share/OVMF/OVMF_VARS.ms.fd; then
+            ovmf_code=/usr/share/OVMF/OVMF_CODE.secboot.fd
+            ovmf_vars=/usr/share/OVMF/OVMF_VARS.ms.fd
+          else
+            echo "Secure Boot OVMF firmware with Microsoft-enrolled variables is unavailable" >&2
+            exit 1
+          fi
+          echo "HYPEMAN_WINDOWS_OVMF_CODE=$ovmf_code" >> "$GITHUB_ENV"
+          echo "HYPEMAN_WINDOWS_OVMF_VARS=$ovmf_vars" >> "$GITHUB_ENV"
+          go mod download
+
+      - name: Verify Linux test toolchain
+        run: |
+          set -euo pipefail
+          TEST_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+          for bin in mkfs.erofs mkfs.ext4 iptables qemu-img qemu-system-x86_64 swtpm; do
+            if ! sudo env "PATH=$TEST_PATH" bash -lc "command -v '$bin' >/dev/null"; then
+              echo "missing required binary under sudo PATH: $bin"
+              exit 1
+            fi
+            sudo env "PATH=$TEST_PATH" bash -lc "command -v '$bin'"
+          done
+          test -f "$HYPEMAN_WINDOWS_OVMF_CODE"
+          test -f "$HYPEMAN_WINDOWS_OVMF_VARS"
+
+      - name: Test Windows hypervisor primitives
+        run: |
+          TEST_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+          for attempt in 1 2 3; do
+            if sudo env \
+              "PATH=$TEST_PATH" \
+              "CI=true" \
+              "HYPEMAN_RUN_WINDOWS_CONFIG_INTEGRATION=1" \
+              "HYPEMAN_WINDOWS_OVMF_CODE=$HYPEMAN_WINDOWS_OVMF_CODE" \
+              "HYPEMAN_WINDOWS_OVMF_VARS=$HYPEMAN_WINDOWS_OVMF_VARS" \
+              go test -count=1 -run '^TestWindowsConfigIntegration$' -timeout 2m ./lib/hypervisor/qemu; then
+              exit 0
+            fi
+            test "$attempt" = 3 || sleep 5
+          done
+          exit 1
+
+      # Slash-command runs are maintainer-approved and need authenticated pulls
+      # for images that are not covered by the prewarm cache.
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Generate OpenAPI code
+        run: make oapi-generate
+
+      - name: Download Cloud Hypervisor binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for version in v49.0 v51.1; do
+            for architecture in x86_64 aarch64; do
+              if [ "$architecture" = "x86_64" ]; then
+                asset="cloud-hypervisor-static"
+                file_pattern='x86-64'
+              else
+                asset="cloud-hypervisor-static-aarch64"
+                file_pattern='aarch64|ARM aarch64'
+              fi
+              destination="lib/vmm/binaries/cloud-hypervisor/$version/$architecture/cloud-hypervisor"
+              mkdir -p "$(dirname "$destination")"
+              gh release download "$version" \
+                --repo cloud-hypervisor/cloud-hypervisor \
+                --pattern "$asset" \
+                --output "$destination" \
+                --clobber
+              chmod +x "$destination"
+              file "$destination" | grep -Eiq "$file_pattern"
+            done
+          done
+
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            if make build; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "build failed (attempt ${attempt}/3); retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          exit 1
+
+      - name: Install UFFD pager systemd template
+        run: |
+          sudo mkdir -p /run/hypeman/uffd
+          sudo tee /etc/systemd/system/hypeman-uffd@.service > /dev/null <<'EOF'
+          [Unit]
+          Description=Hypeman UFFD Pager (%i)
+          Documentation=https://github.com/kernel/hypeman
+          After=network.target
+
+          [Service]
+          Type=simple
+          Environment="HYPEMAN_UFFD_BINARY=/opt/hypeman/bin/hypeman-uffd-pager"
+          Environment="HYPEMAN_UFFD_DATA_DIR=/var/lib/hypeman"
+          Environment="HYPEMAN_UFFD_VERSION_KEY=%i"
+          Environment="HYPEMAN_UFFD_CACHE_MAX_BYTES=4294967296"
+          EnvironmentFile=-/run/hypeman/uffd/%i.env
+          ExecStart=/bin/sh -c 'exec "$HYPEMAN_UFFD_BINARY" --data-dir "$HYPEMAN_UFFD_DATA_DIR" --version-key "$HYPEMAN_UFFD_VERSION_KEY" --cache-max-bytes "$HYPEMAN_UFFD_CACHE_MAX_BYTES"'
+          Restart=on-failure
+          RestartSec=5
+          KillMode=process
+          EOF
+          sudo systemctl daemon-reload
+
+      - name: Prewarm test cache
+        env:
+          DOCKER_CONFIG: /home/debianuser/.docker
+          GITHUB_TOKEN: ${{ github.token }}
+          HYPEMAN_TEST_REGISTRY: 127.0.0.1:5001
+        run: |
+          # Prewarm cache must live on the same filesystem as the test TMPDIR
+          # (/ci): the image build symlinks the oci-cache from here into each
+          # per-test cache and builds rootfs there, and those operations are not
+          # cross-filesystem safe. Keeping both on /ci avoids that.
+          export HYPEMAN_TEST_PREWARM_DIR="/ci/prewarm/linux-amd64"
+          mkdir -p "$HYPEMAN_TEST_PREWARM_DIR"
+          sudo chown -R "$(id -u):$(id -g)" "$HYPEMAN_TEST_PREWARM_DIR"
+          for attempt in 1 2 3; do
+            if go run ./cmd/test-prewarm; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "prewarm failed (attempt ${attempt}/3); retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          exit 1
+
+      - name: Check gofmt
+        run: |
+          set -euo pipefail
+          go_files="$(git ls-files '*.go')"
+          if [ -z "$go_files" ]; then
+            exit 0
+          fi
+          unformatted="$(echo "$go_files" | xargs gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+     
+      - name: Run tests
+        env:
+          GO_TEST_TIMEOUT: 600s
+          GITHUB_TOKEN: ${{ github.token }}
+          # Docker auth for tests running as root (sudo)
+          DOCKER_CONFIG: /home/debianuser/.docker
+          # TLS/ACME testing (optional - tests will skip if not configured)
+          ACME_EMAIL: ${{ env.TEST_PR_HEAD_REPO == github.repository && secrets.ACME_EMAIL || '' }}
+          ACME_DNS_PROVIDER: "cloudflare"
+          ACME_CA: "https://acme-staging-v02.api.letsencrypt.org/directory"
+          CLOUDFLARE_API_TOKEN: ${{ env.TEST_PR_HEAD_REPO == github.repository && secrets.CLOUDFLARE_API_TOKEN || '' }}
+          TLS_TEST_DOMAIN: "test.hypeman-development.com"
+          TLS_ALLOWED_DOMAINS: '*.hypeman-development.com'
+          HYPEMAN_TEST_PREWARM_STRICT: "1"
+          HYPEMAN_TEST_REFLINK_STRICT: "1"
+          HYPEMAN_TEST_REGISTRY: 127.0.0.1:5001
+          HYPEMAN_UFFD_PAGER_BINARY: ${{ runner.temp }}/hypeman-uffd-pager-${{ github.run_id }}-${{ github.run_attempt }}
+          HYPEMAN_UFFD_SYSTEMD_INSTANCE_PREFIX: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          # Fast scratch filesystem provisioned on the runner. Must be reflink-capable
+          # (the VM disk fork fast path uses FICLONE) and kept short to stay under the
+          # 108-char AF_UNIX sun_path limit for VMM control sockets.
+          TMPDIR: /ci
+        run: |
+          cp "$PWD/bin/hypeman-uffd-pager" "$HYPEMAN_UFFD_PAGER_BINARY"
+          chmod +x "$HYPEMAN_UFFD_PAGER_BINARY"
+          export HYPEMAN_TEST_PREWARM_DIR="/ci/prewarm/linux-amd64"
+          make test TEST_TIMEOUT=20m
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+
+          run_prefix="ci-${{ github.run_id }}-${{ github.run_attempt }}"
+          guest_pids=()
+          mapfile -t vmm_pids < <(pgrep -x 'cloud-hyperviso|firecracker|qemu-system-.*' || true)
+          for pid in "${vmm_pids[@]}"; do
+            proc="/proc/$pid"
+            cmdline="$(cat "$proc/cmdline" 2>/dev/null | tr '\0' ' ' || true)"
+            if [[ "$cmdline" == *"/ci/"* ]] && sudo grep -zFqx "HYPEMAN_UFFD_SYSTEMD_INSTANCE_PREFIX=$run_prefix" "$proc/environ" 2>/dev/null; then
+              guest_pids+=("$pid")
+            fi
+          done
+
+          if (( ${#guest_pids[@]} > 0 )); then
+            echo "Stopping leftover test VMs: ${guest_pids[*]}"
+            sudo kill -TERM "${guest_pids[@]}" 2>/dev/null || true
+            sleep 2
+            for pid in "${guest_pids[@]}"; do
+              if sudo kill -0 "$pid" 2>/dev/null; then
+                sudo kill -KILL "$pid" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          units="$(systemctl list-units --all --full --plain 'hypeman-uffd@ci-${{ github.run_id }}-${{ github.run_attempt }}-*.service' --no-legend | awk '{print $1}' || true)"
+          if [ -n "$units" ]; then
+            echo "$units" | xargs -r sudo systemctl stop || true
+            echo "$units" | xargs -r sudo systemctl reset-failed || true
+          fi
+          sudo rm -f /run/hypeman/uffd/ci-${{ github.run_id }}-${{ github.run_attempt }}-*.env
+          rm -f "${{ runner.temp }}/hypeman-uffd-pager-${{ github.run_id }}-${{ github.run_attempt }}"
+
+  report-pr-test:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.pr_number != '' }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Publish test result to the pull request commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_REPO: ${{ inputs.pr_head_repo }}
+          EXPECTED_SHA: ${{ inputs.pr_head_sha }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          pr="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '[.state, .base.ref, .head.repo.full_name, .head.sha] | @tsv')"
+          read -r state base_ref head_repo head_sha <<< "$pr"
+          if [[ "$state" != open || "$base_ref" != main || "$head_repo" != "$EXPECTED_REPO" || "$head_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::notice::Skipping test status because pull request $PR_NUMBER no longer points to the tested commit"
+            exit 0
+          fi
+
+          status=failure
+          description="test run failed"
+          if [[ "$TEST_RESULT" == success ]]; then
+            status=success
+            description="test run passed"
+          fi
+          gh api --method POST "repos/$REPO/statuses/$EXPECTED_SHA" \
+            --field state="$status" \
+            --field context=test \
+            --field description="$description" \
+            --field target_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+
+  test-darwin:
+    runs-on: [self-hosted, macos, arm64]
+    concurrency:
+      group: macos-ci-test-${{ inputs.pr_head_sha || github.ref }}
+      cancel-in-progress: true
+    env:
+      DATA_DIR: /tmp/hypeman-ci-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEST_SOURCE_REPO }}
+          ref: ${{ env.TEST_SOURCE_REF }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Ensure Docker is running
+        run: |
+          if docker info >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          if colima status >/dev/null 2>&1; then
+            colima stop --force || true
+          fi
+
+          if ! colima start; then
+            colima stop --force || true
+            if ! colima start; then
+              colima delete --force
+              colima start
+            fi
+          fi
+
+          for attempt in {1..30}; do
+            if docker info >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "waiting for Docker daemon (${attempt}/30)"
+            sleep 2
+          done
+
+          docker info
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Install dependencies
+        run: |
+          brew list e2fsprogs &>/dev/null || brew install e2fsprogs
+          brew list erofs-utils &>/dev/null || brew install erofs-utils
+          go mod download
+      - name: Create run-scoped data directory
+        run: mkdir -p "$DATA_DIR"
+      - name: Generate OpenAPI code
+        run: make oapi-generate
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make build
+
+      - name: Prewarm test cache
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HYPEMAN_TEST_REGISTRY: 127.0.0.1:5001
+        run: |
+          export HYPEMAN_TEST_PREWARM_DIR="$HOME/.cache/hypeman-ci/darwin-arm64"
+          go run ./cmd/test-prewarm
+
+      - name: Check gofmt
+        run: |
+          set -euo pipefail
+          go_files="$(git ls-files '*.go')"
+          if [ -z "$go_files" ]; then
+            exit 0
+          fi
+          unformatted="$(echo "$go_files" | xargs gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run tests
+        env:
+          GO_TEST_TIMEOUT: 600s
+          DEFAULT_HYPERVISOR: vz
+          GITHUB_TOKEN: ${{ github.token }}
+          JWT_SECRET: ci-test-secret
+          HYPEMAN_TEST_PREWARM_STRICT: "1"
+          HYPEMAN_TEST_REGISTRY: 127.0.0.1:5001
+        run: |
+          export HYPEMAN_TEST_PREWARM_DIR="$HOME/.cache/hypeman-ci/darwin-arm64"
+          make test
+      - name: Run VZ builder integration test
+        env:
+          HYPEMAN_RUN_BUILDER_INTEGRATION_TEST: "1"
+        run: |
+          # Self-hosted runners retain Docker layers across jobs. Prune only
+          # what is stale, and fall back to a full prune when host disk is low.
+          bash scripts/docker-ci-cleanup.sh
+          PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
+            go test -count=1 -tags containers_image_openpgp \
+              -run='^TestBuilderPersistentCacheReuse$' -timeout=20m -v ./integration
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f "vz-shim.*$DATA_DIR" || true
+          rm -rf "$DATA_DIR"
+          make clean
+
+  e2e-install:
+    runs-on: [self-hosted, macos, arm64]
+    needs: test-darwin
+    concurrency:
+      group: macos-ci-e2e-${{ inputs.pr_head_sha || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEST_SOURCE_REPO }}
+          ref: ${{ env.TEST_SOURCE_REF }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install dependencies
+        run: |
+          brew list caddy &>/dev/null || brew install caddy
+          if ! docker info >/dev/null 2>&1; then
+            colima start || {
+              colima stop --force || true
+              colima start
+            }
+          fi
+          for attempt in {1..30}; do
+            if docker info >/dev/null 2>&1; then
+              break
+            fi
+            echo "waiting for Docker daemon (${attempt}/30)"
+            sleep 2
+          done
+          docker info >/dev/null
+          # Self-hosted runners retain Docker layers across jobs. Prune only
+          # what is stale, and fall back to a full prune when host disk is low.
+          bash scripts/docker-ci-cleanup.sh
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Build E2E install artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          make sign-darwin
+          cp bin/hypeman bin/hypeman-api
+          go build -o bin/hypeman-token ./cmd/gen-jwt
+          cp config.example.darwin.yaml bin/
+          docker build -t hypeman/builder:latest \
+            -f lib/builds/images/generic/Dockerfile .
+      - name: Run E2E install test
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Keep the harness pinned to this workflow revision; it runs on a self-hosted runner.
+          curl -fsSL --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/e2e-install-test.sh" \
+            -o "$RUNNER_TEMP/e2e-install-test.sh"
+          HYPEMAN_E2E_REPO_DIR="$PWD" BINARY_DIR="$PWD/bin" \
+            bash "$RUNNER_TEMP/e2e-install-test.sh"
+      - name: Run E2E CLI-only install test
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          CLI_DIR="$(mktemp -d)"
+          INSTALL_DIR="$CLI_DIR" bash scripts/install-cli.sh
+          "$CLI_DIR/hypeman" --version
+      - name: Cleanup on failure
+        if: failure()
+        run: bash scripts/uninstall.sh || true

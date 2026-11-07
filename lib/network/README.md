@@ -1,0 +1,366 @@
+# Network Manager
+
+Manages the default virtual network for instances.
+
+## Platform Support
+
+| Platform | Network Model | Implementation |
+|----------|---------------|----------------|
+| Linux | Bridge + TAP | Linux bridge with TAP devices per VM, iptables NAT |
+| macOS | NAT | Virtualization.framework shared NAT (default: 192.168.64.0/24) |
+
+On macOS, the network manager skips bridge/TAP creation because VZ provides the NAT network. Hypeman currently targets vmnet's default shared subnet, statically allocating guest addresses from `192.168.64.0/24` with gateway `192.168.64.1`; Linux bridge/subnet configuration does not override those values. Host-level `Shared_Net_Address` overrides are not currently supported. Other vmnet clients may receive DHCP leases in the same subnet, so concurrent tools such as Colima, Docker, or UTM can create an address-collision risk that Hypeman's allocator cannot detect.
+
+---
+
+## Linux Networking
+
+On Linux, hypeman manages a virtual network using a Linux bridge and TAP devices.
+
+## How Linux VM Networking Works
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                              HOST                                    │
+│                                                                      │
+│  ┌───────────┐      ┌───────────┐                                    │
+│  │   VM 1    │      │   VM 2    │                                    │
+│  │ (no net)  │      │ 10.100.   │                                    │
+│  │           │      │   5.42    │                                    │
+│  └───────────┘      └─────┬─────┘                                    │
+│                           │                                          │
+│                      ┌────┴────┐                                     │
+│                      │   TAP   │                                     │
+│                      │ hype-x  │                                     │
+│                      └────┬────┘                                     │
+│  ┌───────────────────────────────────────────────────────────────┐   │
+│  │                     LINUX KERNEL                              │   │
+│  │  ┌─────────────┐                           ┌───────────────┐  │   │
+│  │  │   Bridge    │    routing + iptables     │    eth0       │  │   │
+│  │  │  (vmbr0)    │ ─────────────────────────>│   (uplink)    │  │   │
+│  │  │ 10.100.0.1  │      NAT/masquerade       │  public IP    │  │   │
+│  │  └─────────────┘                           └───────┬───────┘  │   │
+│  └────────────────────────────────────────────────────┼──────────┘   │
+│                                                       │              │
+└───────────────────────────────────────────────────────┼──────────────┘
+                                                        │
+                                                   To Internet
+```
+
+**Key concepts:**
+
+- **TAP device**: A virtual network interface. Each VM gets one (unless networking is disabled). It's like a virtual ethernet cable connecting the VM to the host.
+
+- **Bridge**: A virtual network switch inside the kernel. All TAP devices connect to it. The bridge has an IP (the gateway) that VMs use as their default route.
+
+- **Linux kernel as router**: The kernel routes packets between the bridge (VM network) and the uplink (physical network). iptables NAT rules translate VM private IPs to the host's public IP for outbound traffic.
+
+**What Hypeman creates:**
+1. One bridge (`vmbr0`) with the gateway IP (e.g., `10.100.0.1`)
+2. One TAP device per networked VM (e.g., `hype-abc123`)
+3. iptables rules for NAT and forwarding
+
+This setup allows for VMs with an attached network to communicate to the internet and for programs on the host to connect to the VMs via their private IP addresses.
+
+## Overview
+
+Hypeman provides a single default network that all instances can optionally connect to. There is no support for multiple custom networks - instances either have networking enabled (connected to the default network) or disabled (no network connectivity).
+
+## Design Decisions
+
+### State Derivation (No Central Allocations File)
+
+**What:** Network allocations are derived from Cloud Hypervisor and snapshots, not stored in a central file.
+
+**Why:**
+- Single source of truth (CH and snapshots are authoritative)
+- Self-contained guest directories (delete directory = automatic cleanup)
+- No state drift between allocation file and reality
+- Follows instance manager's pattern
+
+**Sources of truth:**
+- **Active VMs** (`Running` or `Initializing`): Query `GetVmInfo()` from Cloud Hypervisor - returns IP/MAC/TAP
+- **Standby VMs**: Read `guests/{id}/snapshots/snapshot-latest/config.json` from snapshot
+- **Stopped VMs**: No network allocation
+
+`Initializing` is treated as fully VMM-active for networking; startup work such as async kernel-headers setup does not change network allocation behavior.
+
+**Metadata storage:**
+```
+/var/lib/hypeman/guests/{instance-id}/
+  metadata.json        # Contains: network_enabled field (bool)
+  snapshots/
+    snapshot-latest/
+      config.json      # Cloud Hypervisor's config with IP/MAC/TAP
+```
+
+### Hybrid Network Model
+
+**Standby → Restore: Network Fixed**
+- TAP device deleted on standby (VMM shutdown)
+- Snapshot `config.json` preserves IP/MAC/TAP names
+- Restore recreates TAP with same name
+- DNS entries unchanged
+- Fast resume path
+
+**Shutdown → Boot: Network Reconfigurable**
+- TAP device deleted, DNS unregistered
+- Can boot with different network settings (enabled/disabled)
+- Allows upgrades, migrations, reconfiguration
+- Full recreate path
+
+### Default Network
+
+- Initialized on the first `Initialize()` call
+- Linux creates it from bridge/subnet configuration
+- macOS targets VZ's default `192.168.64.0/24` shared NAT network regardless of Linux bridge/subnet configuration
+- Named "default" (only network in the system)
+- Linux uses bridge_slave isolated mode for VM-to-VM isolation
+
+### Name Uniqueness
+
+Instance names must be globally unique:
+- Enforced at allocation time by checking all running/standby instances
+- Simpler than per-network scoping
+
+### DNS Configuration
+
+Guests are configured to use external DNS servers directly (no internal DNS server needed):
+- Configurable via `DNS_SERVER` environment variable (default: 1.1.1.1)
+- Set in guest's `/etc/resolv.conf` during boot
+
+### Dependencies
+
+**Go libraries:**
+- `github.com/vishvananda/netlink` - Bridge/TAP operations (standard, used by Docker/K8s)
+
+**Shell commands:**
+- `iptables` - Complex rule manipulation not well-supported in netlink
+- `ip link set X type bridge_slave isolated on` - Netlink library doesn't expose this flag
+
+### Prerequisites
+
+Before running Hypeman, ensure IPv4 forwarding is enabled:
+
+```bash
+# Enable IPv4 forwarding (temporary - until reboot)
+sudo sysctl -w net.ipv4.ip_forward=1
+
+# Enable IPv4 forwarding (persistent across reboots)
+echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+**Why:** Required for routing traffic between VM network and external network. Hypeman will check this at startup and fail with an informative error if not enabled.
+
+### Permissions
+
+Network operations require `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE` capabilities.
+
+**Installation requirement:**
+```bash
+sudo setcap 'cap_net_admin,cap_net_bind_service=+eip' /path/to/hypeman
+```
+
+**Capability flags explained:**
+- `e` = effective (capabilities are active)
+- `i` = inheritable (can be passed to child processes)
+- `p` = permitted (capabilities are available)
+
+**Why:** 
+- Narrowly scoped permissions (not full root), standard practice for network services
+- The `i` flag allows child processes (like `ip` and `iptables` commands) to inherit `CAP_NET_ADMIN` via ambient capabilities, avoiding the need to grant system-wide capabilities to `/usr/bin/ip` or `/usr/sbin/iptables`
+
+## Filesystem Layout
+
+```
+/var/lib/hypeman/
+  network/            # Network state directory (reserved for future use)
+  guests/
+    {instance-id}/
+      metadata.json   # Contains: network_enabled field (bool)
+      snapshots/
+        snapshot-latest/
+          config.json # Contains: IP/MAC/TAP (source of truth)
+```
+
+## Network Operations
+
+### Initialize
+- Create default network bridge (vmbr0 or configured name)
+- Assign gateway IP
+- Setup iptables NAT and forwarding
+
+### CreateAllocation
+1. Get default network details
+2. Reserve name/IP/MAC/TAP identity under the allocation mutex
+3. Create the TAP device and attach it to the bridge
+4. Return once the VM can attach to the TAP
+5. Apply tc rate limits asynchronously when rate limits are configured
+
+### RecreateAllocation (for restore from standby)
+1. Derive allocation from snapshot config.json
+2. Recreate TAP device with same name
+3. Attach to bridge with isolation mode
+4. Return once the VM can attach to the TAP
+5. Reapply rate limits from instance metadata asynchronously
+
+The fork/restore hot path only waits for the network identity reservation and
+TAP creation because those are required before the VMM can start. tc shaping is
+serialized in the background so concurrent forks do not queue behind bridge tc
+updates. The async tc spans are emitted as detached traces, so request/restore
+root spans show only the blocking network work.
+
+### ReleaseAllocation (for shutdown/delete)
+1. Derive current allocation
+2. Remove HTB class from bridge (if upload limiting enabled)
+3. Delete TAP device
+
+## Bidirectional Rate Limiting
+
+Network bandwidth is limited separately for download and upload directions:
+
+```
+                    Internet
+                        │
+                   ┌────┴────┐
+                   │  eth0   │
+                   │ (uplink)│
+                   └────┬────┘
+                        │
+    ┌───────────────────┴───────────────────┐
+    │            Bridge (vmbr0)             │
+    │      HTB qdisc for upload shaping     │
+    │  ┌────────┬────────┐                   │
+    │  │ 1:a1b2 │ 1:c3d4 │                   │
+    │  │ VM-A   │ VM-B   │                   │
+    │  │ rate+  │ rate+  │                   │
+    │  │ ceil   │ ceil   │                   │
+    │  └────┬───┴────┬───┘                   │
+    └───────┼────────┼──────────────────────┘
+            │        │
+       ┌────┴───┐┌───┴────┐
+       │  TAP-A ││  TAP-B │
+       │ + TBF  ││ + TBF  │  (download shaping)
+       └────┬───┘└───┬────┘
+            │        │
+        ┌───┴───┐┌───┴───┐
+        │ VM-A  ││ VM-B  │
+        └───────┘└───────┘
+```
+
+### Download (external → VM)
+- **Method:** TBF (Token Bucket Filter) on TAP device egress
+- **Behavior:** Queues packets to smooth traffic, doesn't drop
+- **Per-VM:** Each TAP gets its own shaper, independent
+
+### Upload (VM → external)
+- **Method:** HTB (Hierarchical Token Bucket) on bridge egress
+- **Behavior:** Fair sharing with guaranteed rates and burst ceilings
+- **Per-VM:** Each VM gets an HTB class with:
+  - `rate`: Guaranteed bandwidth (always available)
+  - `ceil`: Burst ceiling (can use more when others are idle)
+  - `fq_codel`: Leaf qdisc for low latency
+
+### Why Different Methods?
+
+| Direction | Bottleneck | Solution |
+|-----------|------------|----------|
+| Download | Physical NIC ingress | Shape before delivery to each TAP |
+| Upload | Physical NIC egress (shared) | Centralized HTB for fair arbitration |
+
+**Policing (drop-based) was rejected** because it causes TCP to oscillate due to congestion control reacting to packet loss. Shaping (queue-based) provides smoother, more predictable throughput.
+
+### Default Limits
+
+When not specified in the create request:
+- Both download and upload = `(vcpus / cpu_capacity) * network_capacity`
+- Symmetric by default
+- Upload ceiling = 4x guaranteed rate (configurable via `UPLOAD_BURST_MULTIPLIER`)
+
+Note: In case of unexpected scenarios like power loss, straggler TAP devices may persist until manual cleanup or host reboot.
+
+## IP Allocation Strategy
+
+- Gateway at .1 (first IP in subnet)
+- Instance IPs start from .2
+- **Random allocation** with up to 5 retry attempts
+  - Picks random IP in usable range
+  - Checks for conflicts
+  - Retries if conflict found
+  - Falls back to sequential scan if all random attempts fail
+- Helps distribute IPs across large subnets (especially /16)
+- Reduces conflicts when moving standby VMs across hosts
+- Skip network address, gateway, and broadcast address
+- RNG seeded with timestamp for uniqueness across runs
+
+## Concurrency & Locking
+
+The network manager keeps the allocation mutex short and only uses it for
+identity reservation.
+
+### Locked Operations
+- **CreateAllocation identity reservation**: Prevents duplicate names, IPs, MACs, and TAP names
+- **tc updates**: Serialized separately because upload shaping mutates shared bridge state
+
+### Unlocked Operations  
+- **TAP creation**: Runs outside the allocation mutex so concurrent forks can create TAPs in parallel
+- **RecreateAllocation**: Safe without allocation lock - protected by instance-level locking, doesn't allocate IPs
+- **ReleaseAllocation**: Safe without allocation lock - deletes TAP device and serializes with tc updates
+- **Read operations** (GetAllocation, ListAllocations, NameExists): No lock needed - eventual consistency is acceptable
+
+### Why This Works
+- Pending reservations are visible to reads until metadata is persisted
+- TAP creation does not choose identity, so it can run outside the allocation mutex
+- tc work is not required for the VMM attach point and can complete after the fork response
+- Instance manager already provides per-instance locking for state transitions
+
+## Security
+
+**Bridge_slave isolated mode:**
+- Prevents layer-2 VM-to-VM communication
+- VMs can only communicate with gateway (for internet access)
+- Instance proxy could route traffic between VMs if needed in the future
+
+**iptables rules:**
+- NAT for outbound connections
+- Stateful firewall (only allow ESTABLISHED,RELATED inbound)
+- Default DENY for forwarding
+- Rules added on Initialize, per-subnet basis
+
+## Testing
+
+Network manager tests create real network devices (bridges, TAPs) and require elevated permissions.
+
+### Running Tests
+
+```bash
+make test
+```
+
+The Makefile compiles test binaries and grants capabilities via `sudo setcap`, then runs tests as your user (not root).
+
+### Test Isolation
+
+Network integration tests use per-test unique configuration for safe parallel execution:
+
+- Each test gets a unique bridge and /29 subnet in 172.16.0.0/12 range
+- Bridge names: `t{3hex}` (e.g., `t5a3`, `tff2`)
+- 131,072 possible test networks (supports massive parallelism)
+- Tests run safely in parallel with `t.Parallel()`
+- Hash includes test name + PID + timestamp + random = cross-run safe
+
+**Subnet allocation:**
+- /29 subnets = 6 usable IPs per test (sufficient for test cases)
+- Each test creates independent bridge on unique IP
+
+### Cleanup
+
+Cleanup happens automatically via `t.Cleanup()`, which runs even on test failure or panic.
+
+### Unit Tests vs Integration Tests
+
+- **Unit tests** (TestGenerateMAC, etc.): Run without permissions, test logic only
+- **Integration tests** (TestInitializeIntegration, TestCreateAllocationIntegration, etc.): Require permissions, create real devices
+
+All tests run via `make test` - no separate commands needed.

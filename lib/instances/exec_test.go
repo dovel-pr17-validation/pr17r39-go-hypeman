@@ -1,0 +1,339 @@
+package instances
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/kernel/hypeman/lib/guest"
+	"github.com/kernel/hypeman/lib/healthcheck"
+	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/paths"
+	"github.com/kernel/hypeman/lib/system"
+	"github.com/stretchr/testify/require"
+)
+
+// waitForExecAgent polls until exec-agent is ready
+func waitForExecAgent(ctx context.Context, mgr *manager, instanceID string, timeout time.Duration) error {
+	timeout = integrationTestTimeout(timeout)
+	deadline := time.Now().Add(timeout)
+	lastState := StateUnknown
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		inst, err := mgr.GetInstance(ctx, instanceID)
+		if err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		lastState = inst.State
+		// Boot-marker hydration can lag behind a healthy guest-agent, leaving the
+		// instance in Initializing even though exec is already available.
+		if inst.State != StateRunning && inst.State != StateInitializing {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		meta, err := mgr.loadMetadata(instanceID)
+		if err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		dialer, err := hypervisor.NewVsockDialer(meta.HypervisorType, meta.VsockSocket, meta.VsockCID)
+		if err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		var stdout, stderr bytes.Buffer
+		exit, err := guest.ExecIntoInstance(ctx, dialer, guest.ExecOptions{
+			Command: []string{"true"},
+			Stdout:  &stdout,
+			Stderr:  &stderr,
+		})
+		if err == nil && exit.Code == 0 {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("unexpected exit code: %d", exit.Code)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("exec-agent not ready for instance %s within %v (last state: %s): %w", instanceID, timeout, lastState, lastErr)
+	}
+	return fmt.Errorf("exec-agent not ready for instance %s within %v (last state: %s)", instanceID, timeout, lastState)
+}
+
+// Note: execCommand is defined in network_test.go
+
+// TestExecConcurrent tests concurrent exec commands from multiple goroutines.
+// This validates that the exec infrastructure handles concurrent access correctly.
+func TestExecConcurrent(t *testing.T) {
+	t.Parallel()
+	if _, err := os.Stat("/dev/kvm"); os.IsNotExist(err) {
+		t.Skip("/dev/kvm not available, skipping on this platform")
+	}
+
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	manager, tmpDir := setupTestManager(t)
+	ctx := context.Background()
+	startHealthCheckControllerForTest(t, ctx, manager)
+	p := paths.New(tmpDir)
+
+	// Setup image
+	imageManager, err := images.NewManager(p, 1, nil)
+	require.NoError(t, err)
+
+	t.Log("Pulling nginx:alpine image...")
+	_, err = imageManager.CreateImage(ctx, images.CreateImageRequest{
+		Name: integrationTestImageRef(t, "docker.io/library/nginx:alpine"),
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 60; i++ {
+		img, err := imageManager.GetImage(ctx, integrationTestImageRef(t, "docker.io/library/nginx:alpine"))
+		if err == nil && img.Status == images.StatusReady {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	t.Log("Image ready")
+
+	// Ensure system files
+	systemManager := system.NewManager(p)
+	err = systemManager.EnsureSystemFiles(ctx)
+	require.NoError(t, err)
+
+	// Create nginx instance
+	t.Log("Creating nginx instance...")
+	inst, err := manager.CreateInstance(ctx, CreateInstanceRequest{
+		Name:           "exec-test",
+		Image:          integrationTestImageRef(t, "docker.io/library/nginx:alpine"),
+		Size:           2 * 1024 * 1024 * 1024, // 2GB (needs extra room for initrd with NVIDIA libs)
+		HotplugSize:    512 * 1024 * 1024,
+		OverlaySize:    1024 * 1024 * 1024,
+		Vcpus:          2, // More vCPUs for concurrency
+		NetworkEnabled: false,
+		HealthCheck: &healthcheck.Policy{
+			Type:             healthcheck.TypeExec,
+			Interval:         "1s",
+			Timeout:          "1s",
+			StartPeriod:      "30s",
+			FailureThreshold: 3,
+			SuccessThreshold: 1,
+			Exec: &healthcheck.ExecCheck{
+				Command: []string{"true"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, inst.HealthCheck)
+	t.Logf("Instance created: %s", inst.Id)
+	instID := inst.Id
+
+	t.Cleanup(func() {
+		t.Log("Cleaning up...")
+		manager.DeleteInstance(ctx, instID)
+	})
+
+	// This test exercises concurrent exec behavior, not boot-speed budgets.
+	// Give the guest a little more headroom on busy Linux CI runners.
+	err = waitForExecAgent(ctx, manager, inst.Id, 30*time.Second)
+	require.NoError(t, err, "exec-agent should be ready")
+
+	// Verify exec-agent works with a simple command first
+	_, code, err := execCommand(ctx, inst, "echo", "ready")
+	require.NoError(t, err, "initial exec should work")
+	require.Equal(t, 0, code, "initial exec should succeed")
+
+	inst, healthStatus, err := waitForInstanceHealthStatus(ctx, manager, instID, healthcheck.StatusHealthy, 20*time.Second)
+	require.NoError(t, err, "exec health check should report healthy")
+	require.GreaterOrEqual(t, healthStatus.ConsecutiveSuccesses, 1)
+	require.NotNil(t, healthStatus.LastCheckedAt)
+	require.NotNil(t, healthStatus.LastSuccessAt)
+
+	// Run 5 concurrent workers, each doing 25 iterations with its own file
+	// NO RETRIES - this tests that exec works reliably under concurrent load
+	const numWorkers = 5
+	const numIterations = 25
+
+	t.Logf("Running %d concurrent workers, %d iterations each (no retries)...", numWorkers, numIterations)
+
+	var wg sync.WaitGroup
+	errors := make(chan error, numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			filename := fmt.Sprintf("/tmp/test%d.txt", workerID)
+
+			for i := 1; i <= numIterations; i++ {
+				// Write (no retry - must work first time)
+				writeCmd := fmt.Sprintf("echo '%d-%d' > %s", workerID, i, filename)
+				output, code, err := execCommand(ctx, inst, "/bin/sh", "-c", writeCmd)
+				if err != nil {
+					errors <- fmt.Errorf("worker %d, iter %d: write error: %w", workerID, i, err)
+					return
+				}
+				if code != 0 {
+					errors <- fmt.Errorf("worker %d, iter %d: write failed with code %d, output: %s", workerID, i, code, output)
+					return
+				}
+
+				// Read (no retry - must work first time)
+				output, code, err = execCommand(ctx, inst, "cat", filename)
+				if err != nil {
+					errors <- fmt.Errorf("worker %d, iter %d: read error: %w", workerID, i, err)
+					return
+				}
+				if code != 0 {
+					errors <- fmt.Errorf("worker %d, iter %d: read failed with code %d", workerID, i, code)
+					return
+				}
+
+				expected := fmt.Sprintf("%d-%d", workerID, i)
+				actual := strings.TrimSpace(output)
+				if expected != actual {
+					errors <- fmt.Errorf("worker %d, iter %d: expected %q, got %q", workerID, i, expected, actual)
+					return
+				}
+			}
+			t.Logf("Worker %d completed %d iterations", workerID, numIterations)
+		}(w)
+	}
+
+	// Wait for all workers
+	wg.Wait()
+	close(errors)
+
+	// Check for errors
+	var errs []error
+	for err := range errors {
+		errs = append(errs, err)
+	}
+	require.Empty(t, errs, "concurrent exec failed: %v", errs)
+
+	t.Logf("All %d workers completed %d iterations each (total: %d exec pairs)", numWorkers, numIterations, numWorkers*numIterations*2)
+
+	// Phase 2: Test long-running concurrent streams
+	// This verifies streams don't block each other (e.g., multiple shells or streaming commands)
+	t.Log("Phase 2: Testing long-running concurrent streams...")
+
+	const streamWorkers = 5
+	const streamDuration = 2 // seconds
+
+	var streamWg sync.WaitGroup
+	streamErrors := make(chan error, streamWorkers)
+	streamStart := time.Now()
+
+	for w := 0; w < streamWorkers; w++ {
+		streamWg.Add(1)
+		go func(workerID int) {
+			defer streamWg.Done()
+
+			// Command that takes ~2 seconds and produces output
+			cmd := fmt.Sprintf("sleep %d && echo 'stream-%d-done'", streamDuration, workerID)
+			output, code, err := execCommand(ctx, inst, "/bin/sh", "-c", cmd)
+			if err != nil {
+				streamErrors <- fmt.Errorf("stream worker %d: error: %w", workerID, err)
+				return
+			}
+			if code != 0 {
+				streamErrors <- fmt.Errorf("stream worker %d: exit code %d", workerID, code)
+				return
+			}
+			expected := fmt.Sprintf("stream-%d-done", workerID)
+			if !strings.Contains(output, expected) {
+				streamErrors <- fmt.Errorf("stream worker %d: expected %q in output, got %q", workerID, expected, output)
+				return
+			}
+		}(w)
+	}
+
+	streamWg.Wait()
+	close(streamErrors)
+
+	streamElapsed := time.Since(streamStart)
+
+	// Check for errors
+	var streamErrs []error
+	for err := range streamErrors {
+		streamErrs = append(streamErrs, err)
+	}
+	require.Empty(t, streamErrs, "long-running streams failed: %v", streamErrs)
+
+	// If concurrent, should complete in ~2-4s; if serialized would be ~10s
+	maxExpected := time.Duration(streamDuration+2) * time.Second
+	if os.Getenv("CI") == "true" {
+		// GitHub runners can add a bit of scheduling jitter here even when the
+		// streams are overlapping correctly, but serialized execution is still far
+		// above this threshold.
+		maxExpected += time.Second
+	}
+	require.Less(t, streamElapsed, maxExpected,
+		"streams appear serialized - took %v, expected < %v", streamElapsed, maxExpected)
+
+	t.Logf("Long-running streams completed in %v (concurrent OK)", streamElapsed)
+
+	// Phase 3: Test command not found returns quickly (no hang)
+	// Regression test for a hang that occurred when the command wasn't found.
+	t.Log("Phase 3: Testing exec with non-existent command...")
+
+	// Test without TTY
+	dialer, err := hypervisor.NewVsockDialer(inst.HypervisorType, inst.VsockSocket, inst.VsockCID)
+	require.NoError(t, err)
+
+	start := time.Now()
+	var stdout, stderr strings.Builder
+	_, err = guest.ExecIntoInstance(ctx, dialer, guest.ExecOptions{
+		Command: []string{"nonexistent_command_asdfasdf"},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+		TTY:     false,
+	})
+	elapsed := time.Since(start)
+	t.Logf("Exec (no TTY) completed in %v (error: %v)", elapsed, err)
+
+	require.Error(t, err, "exec should fail for non-existent command")
+	require.Contains(t, err.Error(), "executable file not found", "error should mention command not found")
+	require.Less(t, elapsed, 5*time.Second, "exec should not hang, took %v", elapsed)
+
+	// Test with TTY
+	start = time.Now()
+	stdout.Reset()
+	stderr.Reset()
+	_, err = guest.ExecIntoInstance(ctx, dialer, guest.ExecOptions{
+		Command: []string{"nonexistent_command_xyz123"},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+		TTY:     true,
+	})
+	elapsed = time.Since(start)
+	t.Logf("Exec (with TTY) completed in %v (error: %v)", elapsed, err)
+
+	require.Error(t, err, "exec with TTY should fail for non-existent command")
+	require.Contains(t, err.Error(), "executable file not found", "error should mention command not found")
+	require.Less(t, elapsed, 5*time.Second, "exec with TTY should not hang, took %v", elapsed)
+
+	t.Log("Command not found tests passed - exec does not hang")
+}

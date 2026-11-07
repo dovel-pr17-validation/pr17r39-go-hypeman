@@ -1,0 +1,118 @@
+package instances
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/kernel/hypeman/lib/hypervisor"
+	"github.com/kernel/hypeman/lib/images"
+	"github.com/kernel/hypeman/lib/paths"
+	snapshottest "github.com/kernel/hypeman/lib/snapshot/testsupport"
+	"github.com/kernel/hypeman/lib/system"
+	"github.com/stretchr/testify/require"
+)
+
+type snapshotScenarioConfig struct {
+	hypervisor hypervisor.Type
+	sourceName string
+	snapshot   string
+	forkName   string
+	onError    func()
+}
+
+func runStandbySnapshotScenario(t *testing.T, mgr *manager, tmpDir string, cfg snapshotScenarioConfig) {
+	t.Helper()
+	acquireHeavyIO(t)
+
+	ctx := context.Background()
+	p := paths.New(tmpDir)
+
+	onErr := func() {}
+	if cfg.onError != nil {
+		onErr = cfg.onError
+	}
+	requireNoErr := func(err error) {
+		t.Helper()
+		if err != nil {
+			onErr()
+		}
+		require.NoError(t, err)
+	}
+	imageManager, err := images.NewManager(p, 1, nil)
+	requireNoErr(err)
+	snapshottest.EnsureImageReady(t, ctx, p, imageManager, integrationTestImageRef(t, "docker.io/library/alpine:latest"))
+
+	systemManager := system.NewManager(p)
+	requireNoErr(systemManager.EnsureSystemFiles(ctx))
+
+	source, err := mgr.CreateInstance(ctx, CreateInstanceRequest{
+		Name:           cfg.sourceName,
+		Image:          integrationTestImageRef(t, "docker.io/library/alpine:latest"),
+		Size:           lifecycleTestMemorySize,
+		OverlaySize:    10 * 1024 * 1024 * 1024,
+		Vcpus:          1,
+		NetworkEnabled: false,
+		Hypervisor:     cfg.hypervisor,
+		Cmd:            []string{"sleep", "infinity"},
+	})
+	requireNoErr(err)
+	require.Equal(t, cfg.hypervisor, source.HypervisorType)
+	sourceID := source.Id
+	sourceDeleted := false
+	t.Cleanup(func() {
+		if !sourceDeleted {
+			_ = deleteTestInstanceNow(context.Background(), mgr, sourceID)
+		}
+	})
+
+	source, err = waitForInstanceState(ctx, mgr, sourceID, StateRunning, integrationTestTimeout(20*time.Second))
+	requireNoErr(err)
+	require.Equal(t, StateRunning, source.State)
+	_, err = mgr.StandbyInstance(ctx, sourceID, StandbyInstanceRequest{})
+	requireNoErr(err)
+
+	snapshot, err := mgr.CreateSnapshot(ctx, sourceID, CreateSnapshotRequest{
+		Kind: SnapshotKindStandby,
+		Name: cfg.snapshot,
+	})
+	requireNoErr(err)
+	require.Equal(t, SnapshotKindStandby, snapshot.Kind)
+	require.Equal(t, sourceID, snapshot.SourceInstanceID)
+
+	filter := &ListSnapshotsFilter{SourceInstanceID: &sourceID}
+	snapshots, err := mgr.ListSnapshots(ctx, filter)
+	requireNoErr(err)
+	require.NotEmpty(t, snapshots)
+
+	gotSnapshot, err := mgr.GetSnapshot(ctx, snapshot.Id)
+	requireNoErr(err)
+	require.Equal(t, snapshot.Id, gotSnapshot.Id)
+
+	requireNoErr(mgr.DeleteInstance(ctx, sourceID))
+	sourceDeleted = true
+
+	_, err = mgr.GetSnapshot(ctx, snapshot.Id)
+	requireNoErr(err)
+
+	forked, err := mgr.ForkSnapshot(ctx, snapshot.Id, ForkSnapshotRequest{
+		Name:        cfg.forkName,
+		TargetState: StateStandby,
+	})
+	requireNoErr(err)
+	require.Equal(t, StateStandby, forked.State)
+	require.Equal(t, cfg.hypervisor, forked.HypervisorType)
+
+	forkID := forked.Id
+	t.Cleanup(func() { _ = deleteTestInstanceNow(context.Background(), mgr, forkID) })
+	currentFork, err := mgr.GetInstance(ctx, forkID)
+	requireNoErr(err)
+	require.Equal(t, StateStandby, currentFork.State)
+
+	// Gate the reflink assertion on filesystem support: ext4/tmpfs (most
+	// contributor machines, and /tmp) lack reflink and fall back to a full copy,
+	// so the assertion would hard-fail there. In CI strict mode we still assert
+	// unconditionally so the runner catches real reflink regressions. Mirrors the
+	// disk-usage assertion's probeReflinkSupport gating in firecracker_test.go.
+	assertCopyReflinkedGated(t, tmpDir, p.SnapshotGuestDir(snapshot.Id), p.InstanceDir(forkID))
+}
